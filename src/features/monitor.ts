@@ -241,7 +241,7 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
     return sendMessage(ctx.env, ctx.chatId, `🗑 Feed #${id} dihapus.`);
   }
 
-  if (ctx.args.length) {
+  if (ctx.args.length && sub !== "list") {
     const { url, intervalRaw } = splitUrlInterval(ctx.args);
     return addRss(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
   }
@@ -513,7 +513,7 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
     return sendMessage(ctx.env, ctx.chatId, sub === "pause" ? `⏸ Monitor #${id} dijeda.` : `▶️ Monitor #${id} aktif.`);
   }
 
-  if (ctx.args.length) {
+  if (ctx.args.length && sub !== "list") {
     return sendMessage(
       ctx.env,
       ctx.chatId,
