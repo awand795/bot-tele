@@ -4,6 +4,7 @@ import type { Env } from "../env";
 import { editMessage, esc, sendMessage } from "../telegram";
 import { getSetting } from "../users";
 import { formatWib } from "../time";
+import { cronGapMs, nextCronRun, parseCron, type CronSpec } from "../cron-expr";
 
 export type MonitorStatus = "up" | "protected" | "down";
 export type IntervalKind = "monitor" | "rss" | "alert";
@@ -17,6 +18,8 @@ interface FeedRow {
   last_seen: string | null;
   last_checked: number | null;
   interval_min: number;
+  cron_expr: string | null;
+  next_run_at: number | null;
 }
 interface MonitorRow {
   id: number;
@@ -27,6 +30,8 @@ interface MonitorRow {
   last_checked: number | null;
   interval_min: number;
   paused: number;
+  cron_expr: string | null;
+  next_run_at: number | null;
 }
 interface AlertRow {
   id: number;
@@ -37,6 +42,8 @@ interface AlertRow {
   target: number;
   interval_min: number;
   last_checked: number | null;
+  cron_expr: string | null;
+  next_run_at: number | null;
 }
 
 export interface ProbeResult {
@@ -45,6 +52,17 @@ export interface ProbeResult {
   ms: number;
   via?: string;
   note?: string;
+}
+
+export interface Schedule {
+  cron: string | null;
+  minutes: number;
+  nextRunAt: number | null;
+}
+
+interface ScheduleResult {
+  schedule?: Schedule;
+  error?: string;
 }
 
 const FEED_UA = "Mozilla/5.0 (compatible; AdnawaaBot/1.0; +https://github.com/awand795/bot-tele)";
@@ -74,6 +92,149 @@ export function validateInterval(kind: IntervalKind, value: number): number | nu
 export function intervalRange(kind: IntervalKind): string {
   const [min, max] = INTERVAL_LIMITS[kind];
   return `${min}–${max} menit`;
+}
+
+export function scheduleMinGap(kind: IntervalKind): number {
+  return MIN_GAP_MS[kind];
+}
+
+const MIN_GAP_MS: Record<IntervalKind, number> = {
+  monitor: 60_000,
+  rss: 5 * 60_000,
+  alert: 5 * 60_000,
+};
+
+function cleanScheduleInput(raw: string): string {
+  return raw.trim().replace(/^["']+|["']+$/g, "").trim();
+}
+
+function scheduleFromCron(expr: string, minutes: number, now: number, kind: IntervalKind): ScheduleResult {
+  const parsed = parseCron(expr);
+  if (!parsed.spec) return { error: parsed.error ?? "Ekspresi cron tidak valid." };
+
+  const gap = cronGapMs(parsed.spec, now);
+  if (gap === null) return { error: "Jadwal ini tidak pernah terjadi. Periksa tanggal/bulan." };
+  if (gap < MIN_GAP_MS[kind]) {
+    return { error: `Jadwal terlalu rapat. Minimal tiap ${MIN_GAP_MS[kind] / 60_000} menit untuk ${kind}.` };
+  }
+
+  const nextRunAt = nextCronRun(parsed.spec, now);
+  if (nextRunAt === null) return { error: "Tidak ada jadwal berikutnya dalam 8 tahun." };
+
+  return { schedule: { cron: parsed.spec.expr, minutes, nextRunAt } };
+}
+
+/** Jadwal default dari setting; item baru memakai cron default bila diisi owner. */
+export async function getDefaultSchedule(env: Env, kind: IntervalKind, now = Date.now()): Promise<Schedule> {
+  const minutes = await getIntervalDefault(env, kind);
+  const cron = cleanScheduleInput((await getSetting(env, `cron_${kind}`)) ?? "");
+  if (cron) {
+    const parsed = scheduleFromCron(cron, minutes, now, kind);
+    if (parsed.schedule) return parsed.schedule;
+  }
+  return { cron: null, minutes, nextRunAt: null };
+}
+
+/** Parse input jadwal: menit (mis. 10), cron 5 field, atau kosong = default. */
+export async function resolveSchedule(
+  env: Env,
+  kind: IntervalKind,
+  raw: string,
+  now = Date.now(),
+): Promise<ScheduleResult> {
+  const value = cleanScheduleInput(raw);
+  if (!value) return { schedule: await getDefaultSchedule(env, kind, now) };
+
+  if (/^\d+$/.test(value)) {
+    const interval = validateInterval(kind, Number(value));
+    if (interval === null) return { error: `Interval harus ${intervalRange(kind)}.` };
+    return { schedule: { cron: null, minutes: interval, nextRunAt: null } };
+  }
+
+  return scheduleFromCron(value, await getIntervalDefault(env, kind), now, kind);
+}
+
+function scheduleLabel(cron: string | null, minutes: number | null): string {
+  if (cron) return `cron <code>${esc(cron)}</code>`;
+  return `tiap <b>${minutes ?? 5} menit</b>`;
+}
+
+function scheduleLines(cron: string | null, minutes: number | null, nextRunAt: number | null): string[] {
+  if (cron) {
+    const lines = [`Jadwal: <code>${esc(cron)}</code> (WIB)`];
+    if (nextRunAt) lines.push(`Berikutnya: ${formatWib(nextRunAt)}`);
+    return lines;
+  }
+  return [`Jadwal: tiap <b>${minutes ?? 5} menit</b>`];
+}
+
+function nextRunAfter(
+  cron: string | null,
+  now: number,
+  cache?: Map<string, CronSpec | null>,
+): number | null {
+  if (!cron) return null;
+  let spec: CronSpec | null;
+  if (cache?.has(cron)) {
+    spec = cache.get(cron) ?? null;
+  } else {
+    spec = parseCron(cron).spec ?? null;
+    cache?.set(cron, spec);
+  }
+  return spec ? nextCronRun(spec, now) : null;
+}
+
+async function updateCronExpression(
+  env: Env,
+  kind: IntervalKind,
+  table: "monitors" | "feeds" | "alerts",
+  id: number,
+  userId: number,
+  raw: string,
+): Promise<string> {
+  const label = kind === "monitor" ? "Monitor" : kind === "rss" ? "Feed" : "Alert";
+  const exists = await qFirst<{ id: number }>(
+    env,
+    `SELECT id FROM ${table} WHERE id = ? AND user_id = ?`,
+    id,
+    userId,
+  );
+  if (!exists) return `❌ ${label} #${id} tidak ditemukan.`;
+
+  const value = cleanScheduleInput(raw);
+  if (!value || value.toLowerCase() === "off") {
+    await qRun(env, `UPDATE ${table} SET cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?`, id, userId);
+    return `🕘 ${label} #${id} kembali memakai interval menit.`;
+  }
+
+  const parsed = parseCron(value);
+  if (!parsed.spec) return `❌ ${parsed.error ?? "Ekspresi cron tidak valid."}`;
+
+  const now = Date.now();
+  const gap = cronGapMs(parsed.spec, now);
+  if (gap === null) return "❌ Jadwal ini tidak pernah terjadi. Periksa tanggal/bulan.";
+  if (gap < MIN_GAP_MS[kind]) {
+    return `❌ Jadwal terlalu rapat. Minimal tiap ${MIN_GAP_MS[kind] / 60_000} menit.`;
+  }
+
+  const next = nextCronRun(parsed.spec, now);
+  if (next === null) return "❌ Tidak ada jadwal berikutnya dalam 8 tahun.";
+
+  await qRun(
+    env,
+    `UPDATE ${table} SET cron_expr = ?, next_run_at = ? WHERE id = ? AND user_id = ?`,
+    parsed.spec.expr,
+    next,
+    id,
+    userId,
+  );
+  return (
+    `🕘 ${label} #${id} jadwal: <code>${esc(parsed.spec.expr)}</code> (WIB)\n` +
+    `Berikutnya: ${formatWib(next)}\n` +
+    `<i>Kembali ke interval: /${kind === "monitor" ? "monitor" : kind} every ${id} &lt;menit&gt;. Matikan cron: ${
+      kind === "monitor" ? "/monitor" : `/${kind}`
+    } cron ${id} off.</i>`
+  );
 }
 
 function statusIcon(status: string | null | undefined): string {
@@ -149,16 +310,11 @@ async function fetchFeed(url: string): Promise<{ title: string; items: Array<{ i
   return parsed;
 }
 
-function splitUrlInterval(args: string[]): { url: string; intervalRaw: string | null } {
-  const rest = [...args];
-  let intervalRaw: string | null = null;
-  if (rest.length > 1 && /^\d+$/.test(rest[rest.length - 1])) {
-    intervalRaw = rest.pop()!;
-  }
-  return { url: rest.join(" ").trim(), intervalRaw };
+function splitUrlSchedule(args: string[]): { url: string; scheduleRaw: string } {
+  return { url: args[0] ?? "", scheduleRaw: args.slice(1).join(" ").trim() };
 }
 
-export async function addRss(env: Env, userId: number, chatId: number, url: string, intervalArg?: string): Promise<void> {
+export async function addRss(env: Env, userId: number, chatId: number, url: string, scheduleRaw?: string): Promise<void> {
   if (!/^https?:\/\//i.test(url)) {
     await sendMessage(
       env,
@@ -168,15 +324,13 @@ export async function addRss(env: Env, userId: number, chatId: number, url: stri
     return;
   }
 
-  let interval = await getIntervalDefault(env, "rss");
-  if (intervalArg) {
-    const parsed = validateInterval("rss", Number(intervalArg));
-    if (parsed === null) {
-      await sendMessage(env, chatId, `❌ Interval RSS harus ${intervalRange("rss")}.`);
-      return;
-    }
-    interval = parsed;
+  const now = Date.now();
+  const parsedSchedule = await resolveSchedule(env, "rss", scheduleRaw ?? "", now);
+  if (!parsedSchedule.schedule) {
+    await sendMessage(env, chatId, `❌ ${parsedSchedule.error ?? "Jadwal tidak valid."}`);
+    return;
   }
+  const schedule = parsedSchedule.schedule;
 
   const count = await qFirst<{ n: number }>(env, "SELECT COUNT(*) AS n FROM feeds WHERE user_id = ?", userId);
   if ((count?.n ?? 0) >= 5) {
@@ -194,21 +348,23 @@ export async function addRss(env: Env, userId: number, chatId: number, url: stri
 
   await qRun(
     env,
-    "INSERT INTO feeds(user_id, chat_id, url, title, last_seen, last_checked, interval_min, created_at) VALUES(?,?,?,?,?,?,?,?)",
+    "INSERT INTO feeds(user_id, chat_id, url, title, last_seen, last_checked, interval_min, cron_expr, next_run_at, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
     userId,
     chatId,
     url,
     feed.title,
     feed.items[0].id,
-    Date.now(),
-    interval,
-    Date.now(),
+    now,
+    schedule.minutes,
+    schedule.cron,
+    schedule.nextRunAt,
+    now,
   );
   await sendMessage(
     env,
     chatId,
     `📡 <b>Feed ditambahkan</b>\n\n${esc(feed.title || url)}\n${esc(feed.items[0].title)}\n\n` +
-      `⏱ Cek tiap <b>${interval} menit</b>.`,
+      `⏱ ${scheduleLines(schedule.cron, schedule.minutes, schedule.nextRunAt).join("\n")}`,
   );
 }
 
@@ -216,8 +372,8 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
   const sub = (ctx.args[0] ?? "").toLowerCase();
 
   if (sub === "add") {
-    const { url, intervalRaw } = splitUrlInterval(ctx.args.slice(1));
-    return addRss(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
+    const { url, scheduleRaw } = splitUrlSchedule(ctx.args.slice(1));
+    return addRss(ctx.env, ctx.userId, ctx.chatId, url, scheduleRaw);
   }
 
   if (sub === "every" || sub === "interval") {
@@ -230,8 +386,34 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
         `Contoh: <code>/rss every 3 30</code>\nInterval: ${intervalRange("rss")}.`,
       );
     }
-    await qRun(ctx.env, "UPDATE feeds SET interval_min = ? WHERE id = ? AND user_id = ?", interval, id, ctx.userId);
+    await qRun(
+      ctx.env,
+      "UPDATE feeds SET interval_min = ?, cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?",
+      interval,
+      id,
+      ctx.userId,
+    );
     return sendMessage(ctx.env, ctx.chatId, `⏱ Feed #${id} sekarang dicek tiap <b>${interval} menit</b>.`);
+  }
+
+  if (sub === "cron") {
+    const id = Number(ctx.args[1]);
+    if (!Number.isFinite(id)) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        "Contoh: <code>/rss cron 3 */15 * * * *</code>\nMatikan: <code>/rss cron 3 off</code>",
+      );
+    }
+    const message = await updateCronExpression(
+      ctx.env,
+      "rss",
+      "feeds",
+      id,
+      ctx.userId,
+      ctx.args.slice(2).join(" "),
+    );
+    return sendMessage(ctx.env, ctx.chatId, message);
   }
 
   if (sub === "del" || sub === "delete") {
@@ -242,19 +424,21 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
   }
 
   if (ctx.args.length && sub !== "list") {
-    const { url, intervalRaw } = splitUrlInterval(ctx.args);
-    return addRss(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
+    const { url, scheduleRaw } = splitUrlSchedule(ctx.args);
+    return addRss(ctx.env, ctx.userId, ctx.chatId, url, scheduleRaw);
   }
 
   const rows = await qAll<FeedRow>(ctx.env, "SELECT * FROM feeds WHERE user_id = ? ORDER BY id", ctx.userId);
   if (!rows.length) {
+    const def = await getDefaultSchedule(ctx.env, "rss");
     await sendMessage(
       ctx.env,
       ctx.chatId,
       "📡 <b>RSS Monitor</b>\n\n" +
         "Tambah: <code>/rss add https://hnrss.org/frontpage</code>\n" +
-        "Dengan interval: <code>/rss add &lt;url&gt; 30</code>\n\n" +
-        `<i>Default ${await getIntervalDefault(ctx.env, "rss")} menit.</i>`,
+        "Interval: <code>/rss add &lt;url&gt; 30</code>\n" +
+        "Cron: <code>/rss add &lt;url&gt; */15 * * * *</code>\n\n" +
+        `<i>Default: ${def.cron ? `cron ${esc(def.cron)}` : `${def.minutes} menit`}.</i>`,
     );
     return;
   }
@@ -263,10 +447,10 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
   const keyboard: any[] = [];
   for (const row of rows) {
     const title = row.title || shortUrl(row.url);
-    lines.push(`<b>#${row.id}</b> ${esc(title)} · tiap ${row.interval_min ?? 10}m`);
+    lines.push(`<b>#${row.id}</b> ${esc(title)} · ${scheduleLabel(row.cron_expr, row.interval_min)}`);
     keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `rss_del:${row.id}` }]);
   }
-  lines.push("", "<i>Ubah interval: /rss every &lt;id&gt; &lt;menit&gt;</i>");
+  lines.push("", "<i>Ubah: /rss every &lt;id&gt; &lt;menit&gt; · /rss cron &lt;id&gt; &lt;expr|off&gt;</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 
@@ -355,7 +539,7 @@ function monitorDetailText(row: MonitorRow, result?: ProbeResult): string {
     "",
     `Status: ${monitorStatusLine(row, result)}`,
     `Cek terakhir: ${row.last_checked ? formatWib(row.last_checked) : "belum pernah"}`,
-    `Interval: <b>${row.interval_min ?? 5} menit</b>`,
+    ...scheduleLines(row.cron_expr, row.interval_min, row.next_run_at),
     `Keadaan: <b>${row.paused ? "⏸ dijeda" : "▶️ aktif"}</b>`,
   ];
   if (result?.via) lines.push(`Via: ${esc(result.via)}`);
@@ -388,9 +572,18 @@ function monitorDetailKeyboard(row: MonitorRow): any {
 async function probeAndStore(env: Env, row: MonitorRow): Promise<ProbeResult> {
   const result = await probe(row.url);
   const now = Date.now();
-  await qRun(env, "UPDATE monitors SET status = ?, last_checked = ? WHERE id = ?", result.status, now, row.id);
+  const next = nextRunAfter(row.cron_expr, now);
+  await qRun(
+    env,
+    "UPDATE monitors SET status = ?, last_checked = ?, next_run_at = ? WHERE id = ?",
+    result.status,
+    now,
+    next,
+    row.id,
+  );
   row.status = result.status;
   row.last_checked = now;
+  row.next_run_at = next;
   return result;
 }
 
@@ -399,22 +592,19 @@ export async function addMonitor(
   userId: number,
   chatId: number,
   url: string,
-  intervalArg?: string,
+  scheduleRaw?: string,
 ): Promise<void> {
   if (!/^https?:\/\//i.test(url)) {
     await sendMessage(env, chatId, "❌ Kirim URL yang valid. Contoh:\n<code>/monitor add https://example.com</code>");
     return;
   }
 
-  let interval = await getIntervalDefault(env, "monitor");
-  if (intervalArg) {
-    const parsed = validateInterval("monitor", Number(intervalArg));
-    if (parsed === null) {
-      await sendMessage(env, chatId, `❌ Interval monitor harus ${intervalRange("monitor")}.`);
-      return;
-    }
-    interval = parsed;
+  const parsedSchedule = await resolveSchedule(env, "monitor", scheduleRaw ?? "");
+  if (!parsedSchedule.schedule) {
+    await sendMessage(env, chatId, `❌ ${parsedSchedule.error ?? "Jadwal tidak valid."}`);
+    return;
   }
+  const schedule = parsedSchedule.schedule;
 
   const count = await qFirst<{ n: number }>(env, "SELECT COUNT(*) AS n FROM monitors WHERE user_id = ?", userId);
   if ((count?.n ?? 0) >= 5) {
@@ -423,16 +613,20 @@ export async function addMonitor(
   }
 
   const result = await probe(url);
+  const now = Date.now();
+  const nextRunAt = schedule.cron ? nextRunAfter(schedule.cron, now) : null;
   await qRun(
     env,
-    "INSERT INTO monitors(user_id, chat_id, url, status, last_checked, interval_min, paused, created_at) VALUES(?,?,?,?,?,?,0,?)",
+    "INSERT INTO monitors(user_id, chat_id, url, status, last_checked, interval_min, paused, cron_expr, next_run_at, created_at) VALUES(?,?,?,?,?,?,0,?,?,?)",
     userId,
     chatId,
     url,
     result.status,
-    Date.now(),
-    interval,
-    Date.now(),
+    now,
+    schedule.minutes,
+    schedule.cron,
+    nextRunAt,
+    now,
   );
 
   const lines = [
@@ -440,7 +634,7 @@ export async function addMonitor(
     "",
     esc(url),
     `Status: <b>${statusLabel(result.status)}</b>${result.code ? ` (${result.code})` : ""}${result.ms ? ` · ${result.ms} ms` : ""}`,
-    `⏱ Cek tiap <b>${interval} menit</b>.`,
+    ...scheduleLines(schedule.cron, schedule.minutes, nextRunAt),
   ];
   if (result.via) lines.push(`Via: ${esc(result.via)}`);
   if (result.note) lines.push(`\n⚠️ ${esc(result.note)}`);
@@ -454,8 +648,10 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
   const sub = (ctx.args[0] ?? "").toLowerCase();
 
   if (sub === "add") {
-    const { url, intervalRaw } = splitUrlInterval(ctx.args.slice(1));
-    return addMonitor(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
+    const rest = ctx.args.slice(1);
+    const url = rest[0] ?? "";
+    const scheduleRaw = rest.slice(1).join(" ");
+    return addMonitor(ctx.env, ctx.userId, ctx.chatId, url, scheduleRaw);
   }
 
   if (sub === "del" || sub === "delete") {
@@ -492,7 +688,7 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
     }
     await qRun(
       ctx.env,
-      "UPDATE monitors SET interval_min = ? WHERE id = ? AND user_id = ?",
+      "UPDATE monitors SET interval_min = ?, cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?",
       interval,
       id,
       ctx.userId,
@@ -500,17 +696,51 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
     return sendMessage(ctx.env, ctx.chatId, `⏱ Monitor #${id} sekarang dicek tiap <b>${interval} menit</b>.`);
   }
 
+  if (sub === "cron") {
+    const id = Number(ctx.args[1]);
+    if (!Number.isFinite(id)) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        "Contoh: <code>/monitor cron 2 */5 * * * *</code>\nMatikan: <code>/monitor cron 2 off</code>",
+      );
+    }
+    const message = await updateCronExpression(
+      ctx.env,
+      "monitor",
+      "monitors",
+      id,
+      ctx.userId,
+      ctx.args.slice(2).join(" "),
+    );
+    return sendMessage(ctx.env, ctx.chatId, message);
+  }
+
   if (sub === "pause" || sub === "resume") {
     const id = Number(ctx.args[1]);
     if (!Number.isFinite(id)) return sendMessage(ctx.env, ctx.chatId, "Contoh: <code>/monitor pause 2</code>");
-    await qRun(
+
+    if (sub === "pause") {
+      await qRun(ctx.env, "UPDATE monitors SET paused = 1 WHERE id = ? AND user_id = ?", id, ctx.userId);
+      return sendMessage(ctx.env, ctx.chatId, `⏸ Monitor #${id} dijeda.`);
+    }
+
+    const row = await qFirst<MonitorRow>(
       ctx.env,
-      "UPDATE monitors SET paused = ? WHERE id = ? AND user_id = ?",
-      sub === "pause" ? 1 : 0,
+      "SELECT * FROM monitors WHERE id = ? AND user_id = ?",
       id,
       ctx.userId,
     );
-    return sendMessage(ctx.env, ctx.chatId, sub === "pause" ? `⏸ Monitor #${id} dijeda.` : `▶️ Monitor #${id} aktif.`);
+    if (!row) return sendMessage(ctx.env, ctx.chatId, "❌ Monitor tidak ditemukan.");
+    const next = row.cron_expr ? nextRunAfter(row.cron_expr, Date.now()) : null;
+    await qRun(
+      ctx.env,
+      "UPDATE monitors SET paused = 0, next_run_at = ? WHERE id = ? AND user_id = ?",
+      next,
+      id,
+      ctx.userId,
+    );
+    return sendMessage(ctx.env, ctx.chatId, `▶️ Monitor #${id} aktif.`);
   }
 
   if (ctx.args.length && sub !== "list") {
@@ -518,23 +748,27 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
       ctx.env,
       ctx.chatId,
       "📈 <b>Monitor</b>\n\n" +
-        "<code>/monitor add &lt;url&gt; [menit]</code>\n" +
+        "<code>/monitor add &lt;url&gt; [menit|cron]</code>\n" +
         "<code>/monitor test &lt;id&gt;</code>\n" +
         "<code>/monitor every &lt;id&gt; &lt;menit&gt;</code>\n" +
+        "<code>/monitor cron &lt;id&gt; &lt;expr|off&gt;</code>\n" +
         "<code>/monitor pause|resume &lt;id&gt;</code>\n" +
-        "<code>/monitor del &lt;id&gt;</code>",
+        "<code>/monitor del &lt;id&gt;</code>\n\n" +
+        "<i>Contoh cron: <code>*/5 * * * *</code> atau <code>0 9 * * 1-5</code> (WIB).</i>",
     );
   }
 
   const rows = await qAll<MonitorRow>(ctx.env, "SELECT * FROM monitors WHERE user_id = ? ORDER BY id", ctx.userId);
   if (!rows.length) {
+    const def = await getDefaultSchedule(ctx.env, "monitor");
     await sendMessage(
       ctx.env,
       ctx.chatId,
       "📈 <b>Uptime Monitor</b>\n\n" +
         "Tambah: <code>/monitor add https://example.com</code>\n" +
-        "Dengan interval: <code>/monitor add &lt;url&gt; 10</code>\n\n" +
-        `<i>Default ${await getIntervalDefault(ctx.env, "monitor")} menit.</i>`,
+        "Interval: <code>/monitor add &lt;url&gt; 10</code>\n" +
+        "Cron: <code>/monitor add &lt;url&gt; */5 * * * *</code>\n\n" +
+        `<i>Default: ${def.cron ? `cron ${esc(def.cron)}` : `${def.minutes} menit`}.</i>`,
     );
     return;
   }
@@ -542,8 +776,9 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
   const lines = ["📈 <b>Monitor kamu</b>", ""];
   const keyboard: any[] = [];
   for (const row of rows) {
+    const schedule = row.cron_expr ? `cron ${row.cron_expr}` : `${row.interval_min ?? 5}m`;
     lines.push(
-      `${statusIcon(row.status)} <b>#${row.id}</b> ${esc(shortUrl(row.url))} · ${row.interval_min ?? 5}m${
+      `${statusIcon(row.status)} <b>#${row.id}</b> ${esc(shortUrl(row.url))} · ${esc(schedule)}${
         row.paused ? " · ⏸" : ""
       }`,
     );
@@ -551,7 +786,7 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
       { text: `${statusIcon(row.status)} #${row.id} ${shortUrl(row.url)}`.slice(0, 60), callback_data: `mon_view:${row.id}` },
     ]);
   }
-  lines.push("", "<i>Klik monitor untuk detail, cek sekarang, atau ubah interval.</i>");
+  lines.push("", "<i>Klik monitor untuk detail, cek sekarang, atau ubah jadwal.</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 
@@ -590,15 +825,24 @@ export async function handleMonitorCallback(
   if (action === "mon_every") {
     const interval = validateInterval("monitor", Number(rawValue));
     if (interval === null) return true;
-    await qRun(env, "UPDATE monitors SET interval_min = ? WHERE id = ?", interval, id);
+    await qRun(
+      env,
+      "UPDATE monitors SET interval_min = ?, cron_expr = NULL, next_run_at = NULL WHERE id = ?",
+      interval,
+      id,
+    );
     row.interval_min = interval;
+    row.cron_expr = null;
+    row.next_run_at = null;
     await editMessage(env, chatId, messageId, monitorDetailText(row), { keyboard: monitorDetailKeyboard(row) });
     return true;
   }
 
   const paused = action === "mon_pause" ? 1 : 0;
-  await qRun(env, "UPDATE monitors SET paused = ? WHERE id = ?", paused, id);
+  const next = paused === 0 && row.cron_expr ? nextRunAfter(row.cron_expr, Date.now()) : row.next_run_at;
+  await qRun(env, "UPDATE monitors SET paused = ?, next_run_at = ? WHERE id = ?", paused, next, id);
   row.paused = paused;
+  row.next_run_at = next;
   await editMessage(env, chatId, messageId, monitorDetailText(row), { keyboard: monitorDetailKeyboard(row) });
   return true;
 }
@@ -642,8 +886,34 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
         `Contoh: <code>/alert every 1 30</code>\nInterval: ${intervalRange("alert")}.`,
       );
     }
-    await qRun(ctx.env, "UPDATE alerts SET interval_min = ? WHERE id = ? AND user_id = ?", interval, id, ctx.userId);
+    await qRun(
+      ctx.env,
+      "UPDATE alerts SET interval_min = ?, cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?",
+      interval,
+      id,
+      ctx.userId,
+    );
     return sendMessage(ctx.env, ctx.chatId, `⏱ Alert #${id} sekarang dicek tiap <b>${interval} menit</b>.`);
+  }
+
+  if (sub === "cron") {
+    const id = Number(ctx.args[1]);
+    if (!Number.isFinite(id)) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        "Contoh: <code>/alert cron 1 0 * * * *</code>\nMatikan: <code>/alert cron 1 off</code>",
+      );
+    }
+    const message = await updateCronExpression(
+      ctx.env,
+      "alert",
+      "alerts",
+      id,
+      ctx.userId,
+      ctx.args.slice(2).join(" "),
+    );
+    return sendMessage(ctx.env, ctx.chatId, message);
   }
 
   const creating = ["<", ">"].includes(ctx.args[1] ?? "") || ctx.args.length >= 3;
@@ -651,7 +921,7 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
     const symbol = (ctx.args[0] ?? "").toUpperCase();
     const op = ctx.args[1];
     const target = Number(ctx.args[2]);
-    const explicitInterval = ctx.args[3];
+    const scheduleRaw = ctx.args.slice(3).join(" ");
 
     if (!COINS[symbol] || !["<", ">"].includes(op) || !Number.isFinite(target)) {
       return sendMessage(
@@ -661,14 +931,11 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
       );
     }
 
-    let interval = await getIntervalDefault(ctx.env, "alert");
-    if (explicitInterval) {
-      const parsed = validateInterval("alert", Number(explicitInterval));
-      if (parsed === null) {
-        return sendMessage(ctx.env, ctx.chatId, `❌ Interval alert harus ${intervalRange("alert")}.`);
-      }
-      interval = parsed;
+    const parsedSchedule = await resolveSchedule(ctx.env, "alert", scheduleRaw);
+    if (!parsedSchedule.schedule) {
+      return sendMessage(ctx.env, ctx.chatId, `❌ ${parsedSchedule.error ?? "Jadwal tidak valid."}`);
     }
+    const schedule = parsedSchedule.schedule;
 
     const count = await qFirst<{ n: number }>(
       ctx.env,
@@ -679,22 +946,25 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
       return sendMessage(ctx.env, ctx.chatId, "❌ Maksimal 10 alert per user.");
     }
 
+    const now = Date.now();
     await qRun(
       ctx.env,
-      "INSERT INTO alerts(user_id, chat_id, symbol, op, target, triggered, interval_min, last_checked, created_at) VALUES(?,?,?,?,?,0,?,NULL,?)",
+      "INSERT INTO alerts(user_id, chat_id, symbol, op, target, triggered, interval_min, last_checked, cron_expr, next_run_at, created_at) VALUES(?,?,?,?,?,0,?,NULL,?,?,?)",
       ctx.userId,
       ctx.chatId,
       symbol,
       op,
       target,
-      interval,
-      Date.now(),
+      schedule.minutes,
+      schedule.cron,
+      schedule.nextRunAt,
+      now,
     );
     return sendMessage(
       ctx.env,
       ctx.chatId,
       `🔔 Alert diset: <b>${symbol} ${op} ${target.toLocaleString("en-US")}</b> (USD)\n` +
-        `⏱ Cek tiap <b>${interval} menit</b>.`,
+        scheduleLines(schedule.cron, schedule.minutes, schedule.nextRunAt).join("\n"),
     );
   }
 
@@ -703,7 +973,8 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
     return sendMessage(
       ctx.env,
       ctx.chatId,
-      "🔔 <b>Alert Harga</b>\n\n<code>/alert BTC &gt; 100000</code>\n<code>/alert ETH &lt; 2000</code>\n\n" +
+      "🔔 <b>Alert Harga</b>\n\n<code>/alert BTC &gt; 100000</code>\n<code>/alert ETH &lt; 2000</code>\n" +
+        "<code>/alert BTC &gt; 100000 0 9 * * *</code> (cron)\n\n" +
         "Koin: " +
         Object.keys(COINS).join(", "),
     );
@@ -713,13 +984,14 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
   const keyboard: any[] = [];
   for (const row of rows) {
     lines.push(
-      `<b>#${row.id}</b> ${row.symbol} ${row.op} ${row.target.toLocaleString("en-US")} USD · tiap ${
-        row.interval_min ?? 15
-      }m`,
+      `<b>#${row.id}</b> ${row.symbol} ${row.op} ${row.target.toLocaleString("en-US")} USD · ${scheduleLabel(
+        row.cron_expr,
+        row.interval_min,
+      )}`,
     );
     keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `alert_del:${row.id}` }]);
   }
-  lines.push("", "<i>Ubah interval: /alert every &lt;id&gt; &lt;menit&gt;</i>");
+  lines.push("", "<i>Ubah: /alert every &lt;id&gt; &lt;menit&gt; · /alert cron &lt;id&gt; &lt;expr|off&gt;</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 
@@ -735,9 +1007,11 @@ async function safeSend(env: Env, chatId: number | string, text: string, keyboar
 
 export async function checkFeeds(env: Env): Promise<void> {
   const now = Date.now();
+  const cache = new Map<string, CronSpec | null>();
   const rows = await qAll<FeedRow>(
     env,
-    "SELECT * FROM feeds WHERE last_checked IS NULL OR last_checked + COALESCE(interval_min, 10) * 60000 <= ? ORDER BY COALESCE(last_checked, 0) ASC LIMIT 5",
+    "SELECT * FROM feeds WHERE (cron_expr IS NOT NULL AND next_run_at IS NOT NULL AND next_run_at <= ?) OR (cron_expr IS NULL AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 10) * 60000 <= ?)) ORDER BY COALESCE(next_run_at, last_checked, 0) ASC LIMIT 5",
+    now,
     now,
   );
 
@@ -757,17 +1031,26 @@ export async function checkFeeds(env: Env): Promise<void> {
           );
         }
 
+        const checkedAt = Date.now();
         await qRun(
           env,
-          "UPDATE feeds SET last_seen = ?, last_checked = ?, title = ? WHERE id = ?",
+          "UPDATE feeds SET last_seen = ?, last_checked = ?, title = ?, next_run_at = ? WHERE id = ?",
           feed.items[0].id,
-          Date.now(),
+          checkedAt,
           feed.title || row.title,
+          nextRunAfter(row.cron_expr, checkedAt, cache),
           row.id,
         );
       } catch (err) {
         console.warn("feed check failed", row.id, (err as Error).message);
-        await qRun(env, "UPDATE feeds SET last_checked = ? WHERE id = ?", Date.now(), row.id);
+        const checkedAt = Date.now();
+        await qRun(
+          env,
+          "UPDATE feeds SET last_checked = ?, next_run_at = ? WHERE id = ?",
+          checkedAt,
+          nextRunAfter(row.cron_expr, checkedAt, cache),
+          row.id,
+        );
       }
     }),
   );
@@ -775,9 +1058,11 @@ export async function checkFeeds(env: Env): Promise<void> {
 
 export async function checkMonitors(env: Env): Promise<void> {
   const now = Date.now();
+  const cache = new Map<string, CronSpec | null>();
   const rows = await qAll<MonitorRow>(
     env,
-    "SELECT * FROM monitors WHERE paused = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 5) * 60000 <= ?) ORDER BY COALESCE(last_checked, 0) ASC LIMIT 10",
+    "SELECT * FROM monitors WHERE paused = 0 AND ((cron_expr IS NOT NULL AND next_run_at IS NOT NULL AND next_run_at <= ?) OR (cron_expr IS NULL AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 5) * 60000 <= ?))) ORDER BY COALESCE(next_run_at, last_checked, 0) ASC LIMIT 10",
+    now,
     now,
   );
 
@@ -800,11 +1085,13 @@ export async function checkMonitors(env: Env): Promise<void> {
         await safeSend(env, row.chat_id, lines.join("\n"));
       }
 
+      const checkedAt = Date.now();
       await qRun(
         env,
-        "UPDATE monitors SET status = ?, last_checked = ? WHERE id = ?",
+        "UPDATE monitors SET status = ?, last_checked = ?, next_run_at = ? WHERE id = ?",
         result.status,
-        Date.now(),
+        checkedAt,
+        nextRunAfter(row.cron_expr, checkedAt, cache),
         row.id,
       );
     }),
@@ -813,9 +1100,11 @@ export async function checkMonitors(env: Env): Promise<void> {
 
 export async function checkAlerts(env: Env): Promise<void> {
   const now = Date.now();
+  const cache = new Map<string, CronSpec | null>();
   const rows = await qAll<AlertRow>(
     env,
-    "SELECT * FROM alerts WHERE triggered = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 15) * 60000 <= ?) ORDER BY COALESCE(last_checked, 0) ASC LIMIT 50",
+    "SELECT * FROM alerts WHERE triggered = 0 AND ((cron_expr IS NOT NULL AND next_run_at IS NOT NULL AND next_run_at <= ?) OR (cron_expr IS NULL AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 15) * 60000 <= ?))) ORDER BY COALESCE(next_run_at, last_checked, 0) ASC LIMIT 50",
+    now,
     now,
   );
   if (!rows.length) return;
@@ -859,6 +1148,7 @@ export async function checkAlerts(env: Env): Promise<void> {
 
   const checkedAt = Date.now();
   for (const row of rows) {
+    const next = nextRunAfter(row.cron_expr, checkedAt, cache);
     const price = prices[COINS[row.symbol]]?.usd;
     if (Number.isFinite(price)) {
       const hit = row.op === ">" ? price >= row.target : price <= row.target;
@@ -869,11 +1159,17 @@ export async function checkAlerts(env: Env): Promise<void> {
           `🔔 <b>Alert tercapai</b>\n\n${row.symbol} sekarang <b>$${price.toLocaleString("en-US")}</b>\n` +
             `Target: ${row.op} ${row.target.toLocaleString("en-US")}`,
         );
-        await qRun(env, "UPDATE alerts SET triggered = 1, last_checked = ? WHERE id = ?", checkedAt, row.id);
+        await qRun(
+          env,
+          "UPDATE alerts SET triggered = 1, last_checked = ?, next_run_at = ? WHERE id = ?",
+          checkedAt,
+          next,
+          row.id,
+        );
         continue;
       }
     }
-    await qRun(env, "UPDATE alerts SET last_checked = ? WHERE id = ?", checkedAt, row.id);
+    await qRun(env, "UPDATE alerts SET last_checked = ?, next_run_at = ? WHERE id = ?", checkedAt, next, row.id);
   }
 }
 

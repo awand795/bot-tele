@@ -53,8 +53,11 @@ CREATE TABLE IF NOT EXISTS feeds (
   last_seen TEXT,
   last_checked INTEGER,
   interval_min INTEGER NOT NULL DEFAULT 10,
+  cron_expr TEXT,
+  next_run_at INTEGER,
   created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_feeds_next ON feeds(next_run_at);
 
 CREATE TABLE IF NOT EXISTS monitors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,8 +68,11 @@ CREATE TABLE IF NOT EXISTS monitors (
   last_checked INTEGER,
   interval_min INTEGER NOT NULL DEFAULT 5,
   paused INTEGER NOT NULL DEFAULT 0,
+  cron_expr TEXT,
+  next_run_at INTEGER,
   created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_monitors_next ON monitors(next_run_at);
 
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,8 +84,11 @@ CREATE TABLE IF NOT EXISTS alerts (
   triggered INTEGER NOT NULL DEFAULT 0,
   interval_min INTEGER NOT NULL DEFAULT 15,
   last_checked INTEGER,
+  cron_expr TEXT,
+  next_run_at INTEGER,
   created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_alerts_next ON alerts(next_run_at);
 
 CREATE TABLE IF NOT EXISTS ai_usage (
   user_id INTEGER NOT NULL,

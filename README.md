@@ -79,20 +79,37 @@ Format pengingat (WIB):
 
 ### 📡 Monitor
 
-| Command | Fungsi | Interval default |
+| Command | Fungsi | Jadwal default |
 | --- | --- | --- |
-| `/rss add <url> [menit]` | Notifikasi item RSS/Atom baru (maks 5/user) | 10 menit |
-| `/monitor add <url> [menit]` | Notifikasi website up/down (maks 5/user) | 5 menit |
-| `/alert BTC > 100000 [menit]` | Alert harga crypto USD (maks 10/user) | 15 menit |
+| `/rss add <url> [menit\|cron]` | Notifikasi item RSS/Atom baru (maks 5/user) | 10 menit |
+| `/monitor add <url> [menit\|cron]` | Notifikasi website up/down (maks 5/user) | 5 menit |
+| `/alert BTC > 100000 [menit\|cron]` | Alert harga crypto USD (maks 10/user) | 15 menit |
 | `/gh owner/repo` | Notifikasi GitHub (push, issue, PR, release, workflow) | realtime webhook |
 
-- Cron Worker tetap jalan **tiap menit**; setiap item hanya dicek jika sudah jatuh tempo (`last_checked + interval_min`).
-- Ubah interval per item: `/monitor every <id> <menit>`, `/rss every <id> <menit>`, `/alert every <id> <menit>`.
+- Cron Worker tetap jalan **tiap menit**. Item interval dicek jika `last_checked + interval_min` sudah lewat; item cron dicek jika `next_run_at` sudah lewat.
+- Interval per item: `/monitor every <id> <menit>`, `/rss every <id> <menit>`, `/alert every <id> <menit>`.
+- Cron per item: `/monitor cron <id> <expr>`, `/rss cron <id> <expr>`, `/alert cron <id> <expr>`. Pakai `off` untuk kembali ke interval.
 - `/monitor` tanpa argumen menampilkan daftar; klik item untuk **cek sekarang**, pilih **1m/5m/15m/60m**, **jeda/aktifkan**, atau hapus.
-- Default global untuk item baru diatur owner lewat `/cron` dan `/cron set monitor|rss|alert <menit>`.
+- Default item baru diatur owner lewat `/cron` dan `/cron set monitor|rss|alert <menit|expr>`.
 - Status uptime: 🟢 **up** (2xx–3xx), 🟡 **terproteksi** (401/403/429 — server merespons tapi akses dibatasi), 🔴 **down** (5xx, timeout, 4xx lain).
 - Harga: CoinGecko, fallback Binance jika kena rate limit.
 - GitHub webhook: `POST /gh/<WEBHOOK_SECRET>`, signatura `X-Hub-Signature-256` diverifikasi.
+
+#### Cron expression
+
+Format 5 field: **menit jam tanggal bulan hari**, dievaluasi sebagai **WIB (UTC+7)**.
+
+```text
+*/5 * * * *        setiap 5 menit
+0 9 * * 1-5        Senin–Jumat 09:00 WIB
+30 7 1 * *         tanggal 1 tiap bulan 07:30 WIB
+0 0 * * SUN        Minggu 00:00 WIB
+0 9,18 * * *       09:00 dan 18:00 WIB
+```
+
+Didukung: `*`, `*/n`, `a`, `a-b`, `a-b/n`, `a/n`, daftar (`1,15,30`), nama bulan (`JAN`–`DEC`), nama hari (`SUN`–`SAT`), `7` = Minggu. Tanggal dan hari memakai semantik **OR** bila keduanya dibatasi. Jadwal yang terlalu rapat ditolak: monitor minimal 1 menit, RSS/alert minimal 5 menit. Gunakan `/cron test <expr>` untuk melihat 5 jadwal berikutnya.
+
+> Trigger Cloudflare tetap `* * * * *`; ekspresi cron disimpan di D1 dan dievaluasi oleh bot. Trigger deploy tidak bisa diubah lewat command.
 
 ### ⚙️ Setting & admin
 
@@ -107,8 +124,9 @@ Format pengingat (WIB):
 | `/stats` | owner | Statistik hari ini |
 | `/audit` | owner | Audit log terakhir |
 | `/gh owner/repo` | owner | Aktifkan notifikasi GitHub |
-| `/cron` | owner | Lihat antrean & interval default |
-| `/cron set <monitor\|rss\|alert> <menit>` | owner | Ubah interval default item baru |
+| `/cron` | owner | Lihat antrean & jadwal default |
+| `/cron set <monitor\|rss\|alert> <menit\|expr>` | owner | Ubah jadwal default item baru |
+| `/cron test <expr>` | owner | Lihat 5 jadwal berikutnya (WIB) |
 
 - User pertama yang `/start` menjadi **owner**.
 - User lain masuk status **pending** sampai di-`/allow`.
@@ -160,9 +178,9 @@ todos(id, user_id, text, done, created_at)
 reminders(id, user_id, chat_id, text, due_at, sent, created_at)
 pastes(slug, user_id, text, created_at, expires_at)
 feeds(id, user_id, chat_id, url, title, last_seen, last_checked, created_at)
-feeds(id, user_id, chat_id, url, title, last_seen, last_checked, interval_min, created_at)
-monitors(id, user_id, chat_id, url, status, last_checked, interval_min, paused, created_at)
-alerts(id, user_id, chat_id, symbol, op, target, triggered, interval_min, last_checked, created_at)
+feeds(id, user_id, chat_id, url, title, last_seen, last_checked, interval_min, cron_expr, next_run_at, created_at)
+monitors(id, user_id, chat_id, url, status, last_checked, interval_min, paused, cron_expr, next_run_at, created_at)
+alerts(id, user_id, chat_id, symbol, op, target, triggered, interval_min, last_checked, cron_expr, next_run_at, created_at)
 ai_usage(user_id, day, count)
 stats(day, feature, count)
 audit(id, user_id, action, meta, created_at)
@@ -189,6 +207,7 @@ src/
   db.ts                 # helper D1
   users.ts              # user & whitelist
   time.ts               # WIB & parser reminder
+  cron-expr.ts          # parser cron 5 field + next run (WIB)
   stats.ts              # stats + audit
   cron.ts               # entry cron tiap menit
   preview.ts            # preview media + tombol download

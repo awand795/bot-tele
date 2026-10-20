@@ -164,10 +164,11 @@ export const HELP_TEXT =
   "/tr en &lt;teks&gt; · /img &lt;prompt&gt; · /tts &lt;teks&gt;\n" +
   "/stt (reply voice note)\n\n" +
   "<b>Monitor</b>\n" +
-  "/rss add &lt;url&gt; [menit] · /monitor add &lt;url&gt; [menit]\n" +
-  "/alert BTC &gt; 100000 [menit] · /gh owner/repo\n" +
-  "/monitor test|every|pause|resume · /rss every · /alert every\n" +
-  "/cron (owner) — lihat &amp; atur interval default\n\n" +
+  "/rss add &lt;url&gt; [menit|cron] · /rss cron &lt;id&gt; &lt;expr|off&gt;\n" +
+  "/monitor add &lt;url&gt; [menit|cron] · /monitor cron &lt;id&gt; &lt;expr|off&gt;\n" +
+  "/alert BTC &gt; 100000 [menit|cron] · /alert cron &lt;id&gt; &lt;expr|off&gt;\n" +
+  "/monitor test|every|pause|resume · /gh owner/repo\n" +
+  "/cron (owner) · /cron test &lt;expr&gt;\n\n" +
   "<b>Admin (owner)</b>\n" +
   "/allow &lt;id&gt; · /deny &lt;id&gt; · /users\n" +
   "/stats · /audit · /status · /backup\n\n" +
@@ -245,11 +246,13 @@ export const MONITOR_TEXT =
   "📈 <b>Uptime</b> — <code>/monitor add https://example.com</code>\n" +
   "🔔 <b>Harga</b> — <code>/alert BTC &gt; 100000</code>\n" +
   "🐙 <b>GitHub</b> — <code>/gh owner/repo</code>\n\n" +
-  "⏱ <b>Interval bisa diatur</b> per item:\n" +
-  "<code>/monitor add &lt;url&gt; 10</code> · <code>/rss every &lt;id&gt; 30</code>\n" +
-  "<code>/alert every &lt;id&gt; 15</code> · <code>/monitor every &lt;id&gt; 5</code>\n\n" +
-  "Buka daftar monitor → klik item untuk cek sekarang, ubah interval, jeda, atau hapus.\n\n" +
-  "<i>Default: RSS 10m, uptime 5m, harga 15m. Owner bisa ubah lewat /cron.</i>\n" +
+  "⏱ <b>Jadwal per item</b>\n" +
+  "Interval: <code>/monitor every 2 10</code>\n" +
+  "Cron: <code>/monitor add &lt;url&gt; */10 * * * *</code>\n" +
+  "Ubah cron: <code>/monitor cron 2 0 9 * * 1-5</code>\n" +
+  "Matikan cron: <code>/monitor cron 2 off</code>\n\n" +
+  "Buka daftar monitor → klik item untuk cek sekarang, ubah jadwal, jeda, atau hapus.\n\n" +
+  "<i>Cron 5 field (menit jam tanggal bulan hari), zona WIB. Contoh: <code>*/5 * * * *</code>, <code>0 9 * * 1-5</code>.</i>\n" +
   "<i>Status 🟡 = server merespons tapi akses dibatasi (401/403/429).</i>";
 
 export const SETTING_TEXT =
@@ -260,7 +263,8 @@ export const SETTING_TEXT =
   "<b>Owner</b>\n" +
   "/allow &lt;id&gt; · /deny &lt;id&gt; · /users\n" +
   "/stats · /audit · /gh owner/repo\n" +
-  "/cron · /cron set monitor|rss|alert &lt;menit&gt;";
+  "/cron · /cron set monitor|rss|alert &lt;menit|expr&gt;\n" +
+  "/cron test &lt;expr&gt;";
 
 export function rateLimited(resetInMinutes: number): string {
   return (

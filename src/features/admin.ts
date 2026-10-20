@@ -5,12 +5,8 @@ import { getOwner, getSetting, listUsers, setRole, setSetting } from "../users";
 import { formatWib, wibDay } from "../time";
 import { logAudit } from "../stats";
 import type { Env } from "../env";
-import {
-  getIntervalDefault,
-  intervalRange,
-  validateInterval,
-  type IntervalKind,
-} from "./monitor";
+import { nextCronRuns, parseCron } from "../cron-expr";
+import { getDefaultSchedule, resolveSchedule, type IntervalKind } from "./monitor";
 
 export async function isOwner(env: Env, userId: number): Promise<boolean> {
   const owner = await getOwner(env);
@@ -190,6 +186,29 @@ export async function cmdCron(ctx: Ctx): Promise<void> {
   if (!(await ownerOnly(ctx))) return;
 
   const sub = (ctx.args[0] ?? "").toLowerCase();
+
+  if (sub === "test") {
+    const raw = ctx.args.slice(1).join(" ").trim();
+    const parsed = parseCron(raw);
+    if (!parsed.spec) {
+      return sendMessage(ctx.env, ctx.chatId, `❌ ${parsed.error ?? "Ekspresi cron tidak valid."}`);
+    }
+    const runs = nextCronRuns(parsed.spec, Date.now(), 5);
+    if (!runs.length) {
+      return sendMessage(ctx.env, ctx.chatId, "❌ Tidak ada jadwal berikutnya dalam 8 tahun.");
+    }
+    return sendMessage(
+      ctx.env,
+      ctx.chatId,
+      [
+        `🕘 <b>Cron test</b>`,
+        `<code>${esc(parsed.spec.expr)}</code> (WIB)`,
+        "",
+        ...runs.map((run, index) => `${index + 1}. ${formatWib(run)}`),
+      ].join("\n"),
+    );
+  }
+
   if (sub === "set") {
     const aliases: Record<string, IntervalKind> = {
       monitor: "monitor",
@@ -200,75 +219,128 @@ export async function cmdCron(ctx: Ctx): Promise<void> {
       harga: "alert",
     };
     const kind = aliases[(ctx.args[1] ?? "").toLowerCase()];
-    const value = validateInterval(kind ?? "monitor", Number(ctx.args[2]));
-    if (!kind || value === null) {
+    const raw = ctx.args.slice(2).join(" ").trim();
+
+    if (!kind || !raw) {
       return sendMessage(
         ctx.env,
         ctx.chatId,
-        "Contoh: <code>/cron set monitor 10</code>\n" +
-          "Jenis: <code>monitor</code>, <code>rss</code>, <code>alert</code>\n" +
-          `Rentang: monitor ${intervalRange("monitor")}, RSS ${intervalRange("rss")}, alert ${intervalRange("alert")}.`,
+        "Contoh:\n" +
+          "<code>/cron set monitor 10</code>\n" +
+          "<code>/cron set monitor */10 * * * *</code>\n" +
+          "<code>/cron set rss */15 * * * *</code>\n" +
+          "<code>/cron set alert 0 * * * *</code>\n\n" +
+          "Jenis: <code>monitor</code>, <code>rss</code>, <code>alert</code>.",
       );
     }
-    await setSetting(ctx.env, `interval_${kind}`, String(value));
-    await logAudit(ctx.env, ctx.userId, "cron_set", `${kind}=${value}`);
+
+    const parsed = await resolveSchedule(ctx.env, kind, raw);
+    if (!parsed.schedule) {
+      return sendMessage(ctx.env, ctx.chatId, `❌ ${parsed.error ?? "Jadwal tidak valid."}`);
+    }
+    const schedule = parsed.schedule;
+
+    if (schedule.cron) {
+      await setSetting(ctx.env, `cron_${kind}`, schedule.cron);
+      await logAudit(ctx.env, ctx.userId, "cron_set", `${kind}=${schedule.cron}`);
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        `⏱ Default <b>${kind}</b> sekarang cron <code>${esc(schedule.cron)}</code> (WIB).\n` +
+          `<i>Item baru otomatis memakai jadwal ini. Item lama tidak berubah.</i>`,
+      );
+    }
+
+    const minutes = schedule.minutes;
+    await setSetting(ctx.env, `interval_${kind}`, String(minutes));
+    await setSetting(ctx.env, `cron_${kind}`, "");
+    await logAudit(ctx.env, ctx.userId, "cron_set", `${kind}=${minutes}m`);
     return sendMessage(
       ctx.env,
       ctx.chatId,
-      `⏱ Default interval <b>${kind}</b> sekarang <b>${value} menit</b>.\n<i>Item lama tidak berubah; atur per item lewat /${kind === "monitor" ? "monitor every" : kind === "rss" ? "rss every" : "alert every"}.</i>`,
+      `⏱ Default <b>${kind}</b> sekarang <b>${minutes} menit</b>.\n` +
+        `<i>Item baru otomatis memakai interval ini. Item lama tidak berubah.</i>`,
     );
   }
 
   const defaults = {
-    monitor: await getIntervalDefault(ctx.env, "monitor"),
-    rss: await getIntervalDefault(ctx.env, "rss"),
-    alert: await getIntervalDefault(ctx.env, "alert"),
+    monitor: await getDefaultSchedule(ctx.env, "monitor"),
+    rss: await getDefaultSchedule(ctx.env, "rss"),
+    alert: await getDefaultSchedule(ctx.env, "alert"),
   };
   const now = Date.now();
 
-  const [monitorDue, feedDue, alertDue, monitorAll, feedAll, alertAll] = await Promise.all([
+  const [
+    monitorDue,
+    feedDue,
+    alertDue,
+    monitorAll,
+    feedAll,
+    alertAll,
+    monitorCron,
+    feedCron,
+    alertCron,
+  ] = await Promise.all([
     qFirst<{ n: number }>(
       ctx.env,
-      "SELECT COUNT(*) AS n FROM monitors WHERE paused = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 5) * 60000 <= ?)",
+      "SELECT COUNT(*) AS n FROM monitors WHERE paused = 0 AND ((cron_expr IS NOT NULL AND next_run_at IS NOT NULL AND next_run_at <= ?) OR (cron_expr IS NULL AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 5) * 60000 <= ?)))",
+      now,
       now,
     ),
     qFirst<{ n: number }>(
       ctx.env,
-      "SELECT COUNT(*) AS n FROM feeds WHERE last_checked IS NULL OR last_checked + COALESCE(interval_min, 10) * 60000 <= ?",
+      "SELECT COUNT(*) AS n FROM feeds WHERE (cron_expr IS NOT NULL AND next_run_at IS NOT NULL AND next_run_at <= ?) OR (cron_expr IS NULL AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 10) * 60000 <= ?))",
+      now,
       now,
     ),
     qFirst<{ n: number }>(
       ctx.env,
-      "SELECT COUNT(*) AS n FROM alerts WHERE triggered = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 15) * 60000 <= ?)",
+      "SELECT COUNT(*) AS n FROM alerts WHERE triggered = 0 AND ((cron_expr IS NOT NULL AND next_run_at IS NOT NULL AND next_run_at <= ?) OR (cron_expr IS NULL AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 15) * 60000 <= ?)))",
+      now,
       now,
     ),
     qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM monitors"),
     qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM feeds"),
     qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM alerts WHERE triggered = 0"),
+    qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM monitors WHERE cron_expr IS NOT NULL"),
+    qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM feeds WHERE cron_expr IS NOT NULL"),
+    qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM alerts WHERE cron_expr IS NOT NULL"),
   ]);
+
+  const defaultLine = (schedule: Awaited<ReturnType<typeof getDefaultSchedule>>): string => {
+    if (schedule.cron) return `cron <code>${esc(schedule.cron)}</code> (fallback ${schedule.minutes}m)`;
+    return `${schedule.minutes} menit`;
+  };
 
   await sendMessage(
     ctx.env,
     ctx.chatId,
     [
-      "⏱ <b>Cron & interval</b>",
+      "⏱ <b>Cron & jadwal</b>",
       "",
+      "Trigger Worker: <code>* * * * *</code> (tiap menit, WIB)",
       "Reminder: tiap <b>1 menit</b> (tetap)",
-      `Monitor: default <b>${defaults.monitor} menit</b>`,
-      `RSS: default <b>${defaults.rss} menit</b>`,
-      `Alert: default <b>${defaults.alert} menit</b>`,
       "",
-      `<b>Antrean sekarang</b>`,
-      `📈 monitor due: ${monitorDue?.n ?? 0}/${monitorAll?.n ?? 0}`,
-      `📡 feed due: ${feedDue?.n ?? 0}/${feedAll?.n ?? 0}`,
-      `🔔 alert due: ${alertDue?.n ?? 0}/${alertAll?.n ?? 0}`,
+      "<b>Default item baru</b>",
+      `📈 Monitor: ${defaultLine(defaults.monitor)}`,
+      `📡 RSS: ${defaultLine(defaults.rss)}`,
+      `🔔 Alert: ${defaultLine(defaults.alert)}`,
+      "",
+      "<b>Antrean sekarang</b>",
+      `📈 monitor due: ${monitorDue?.n ?? 0}/${monitorAll?.n ?? 0} · cron ${monitorCron?.n ?? 0}`,
+      `📡 feed due: ${feedDue?.n ?? 0}/${feedAll?.n ?? 0} · cron ${feedCron?.n ?? 0}`,
+      `🔔 alert due: ${alertDue?.n ?? 0}/${alertAll?.n ?? 0} · cron ${alertCron?.n ?? 0}`,
       "",
       "<b>Ubah default</b>",
       "<code>/cron set monitor 10</code>",
-      "<code>/cron set rss 30</code>",
-      "<code>/cron set alert 15</code>",
+      "<code>/cron set monitor */10 * * * *</code>",
+      "<code>/cron set rss */15 * * * *</code>",
+      "<code>/cron set alert 0 * * * *</code>",
       "",
-      "<i>Interval per item: /monitor every, /rss every, /alert every.</i>",
+      "<b>Tes ekspresi</b>",
+      "<code>/cron test 0 9 * * 1-5</code>",
+      "",
+      "<i>Per item: /monitor cron, /rss cron, /alert cron. Semua jadwal WIB.</i>",
     ].join("\n"),
   );
 }
