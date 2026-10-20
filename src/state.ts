@@ -39,14 +39,23 @@ export type Flow =
   | "rss"
   | "monitor"
   | "alert"
+  | "schedule"
   | "ringkas"
   | "tr"
   | "img"
   | "tts";
 
+export type ScheduleKind = "monitor" | "rss" | "alert";
+
+export interface ScheduleTarget {
+  kind: ScheduleKind;
+  id: number;
+}
+
 export interface UserState {
   flow: Flow;
   at: number;
+  data?: unknown;
 }
 
 const TTL = 60 * 60; // 1 hour
@@ -68,8 +77,15 @@ export async function getState(env: Env, userId: number): Promise<UserState | nu
   return getJson<UserState>(env, `st:${userId}`);
 }
 
-export async function setState(env: Env, userId: number, flow: UserState["flow"]): Promise<void> {
-  await putJson(env, `st:${userId}`, { flow, at: Date.now() } satisfies UserState, 30 * 60);
+export async function setState(
+  env: Env,
+  userId: number,
+  flow: UserState["flow"],
+  data?: unknown,
+): Promise<void> {
+  const value: UserState = { flow, at: Date.now() };
+  if (data !== undefined) value.data = data;
+  await putJson(env, `st:${userId}`, value, 30 * 60);
 }
 
 export async function clearState(env: Env, userId: number): Promise<void> {

@@ -1,7 +1,7 @@
 import type { Ctx } from "./context";
 import type { Env } from "../env";
-import type { Action, Flow } from "../state";
-import { clearState, setState } from "../state";
+import type { Action, Flow, ScheduleTarget } from "../state";
+import { clearState, getState, setState } from "../state";
 import type { TgCallbackQuery } from "../types";
 import { bump } from "../stats";
 import { backMenu } from "../menus";
@@ -155,6 +155,16 @@ export async function dispatchFlow(ctx: Ctx, flow: Flow): Promise<boolean> {
       case "alert":
         await monitor.cmdAlert(withText);
         break;
+      case "schedule": {
+        const state = await getState(ctx.env, ctx.userId);
+        const target = state?.data as ScheduleTarget | undefined;
+        if (!target?.kind || !Number.isFinite(target.id)) {
+          await sendMessage(ctx.env, ctx.chatId, "❌ Sesi jadwal sudah habis. Buka daftar lalu klik ⏱ lagi.");
+          break;
+        }
+        await monitor.applyScheduleInput(ctx, target, text);
+        break;
+      }
       case "note":
         await productivity.cmdNote({ ...ctx, args: [text] });
         break;
@@ -221,6 +231,10 @@ export async function dispatchCallback(
     await setState(env, cb.from.id, spec.flow);
     await sendMessage(env, chatId, spec.text, { keyboard: backMenu() });
     return true;
+  }
+
+  if (data.startsWith("sched_")) {
+    if (await monitor.handleScheduleCallback(env, chatId, messageId, cb.from.id, data)) return true;
   }
 
   if (data.startsWith("mon_")) {

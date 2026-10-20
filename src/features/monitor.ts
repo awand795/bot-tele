@@ -5,6 +5,7 @@ import { editMessage, esc, sendMessage } from "../telegram";
 import { getSetting } from "../users";
 import { formatWib } from "../time";
 import { cronGapMs, nextCronRun, parseCron, type CronSpec } from "../cron-expr";
+import { setState, type ScheduleKind, type ScheduleTarget } from "../state";
 
 export type MonitorStatus = "up" | "protected" | "down";
 export type IntervalKind = "monitor" | "rss" | "alert";
@@ -237,6 +238,240 @@ async function updateCronExpression(
   );
 }
 
+/* --------------------------- jadwal picker --------------------------- */
+
+const SCHEDULE_TABLES: Record<ScheduleKind, "monitors" | "feeds" | "alerts"> = {
+  monitor: "monitors",
+  rss: "feeds",
+  alert: "alerts",
+};
+
+interface ScheduleRow {
+  id: number;
+  interval_min: number;
+  cron_expr: string | null;
+  next_run_at: number | null;
+  url?: string;
+  title?: string | null;
+  symbol?: string;
+  op?: string;
+  target?: number;
+}
+
+function scheduleKindLabel(kind: ScheduleKind): string {
+  if (kind === "monitor") return "Monitor";
+  if (kind === "rss") return "Feed";
+  return "Alert";
+}
+
+function scheduleBackData(kind: ScheduleKind, id: number): string {
+  if (kind === "monitor") return `mon_view:${id}`;
+  return kind === "rss" ? "menu:rss" : "menu:alert";
+}
+
+async function getScheduleRow(
+  env: Env,
+  kind: ScheduleKind,
+  id: number,
+  userId: number,
+): Promise<ScheduleRow | null> {
+  const table = SCHEDULE_TABLES[kind];
+  if (!table) return null;
+  return qFirst<ScheduleRow>(env, `SELECT * FROM ${table} WHERE id = ? AND user_id = ?`, id, userId);
+}
+
+function scheduleEditorText(kind: ScheduleKind, row: ScheduleRow): string {
+  let detail = "";
+  if (kind === "monitor") {
+    detail = esc(row.url ?? "");
+  } else if (kind === "rss") {
+    detail = esc(row.title || row.url || `Feed #${row.id}`);
+  } else {
+    detail = `<b>${esc(row.symbol ?? "")}</b> ${esc(row.op ?? "")} ${(row.target ?? 0).toLocaleString("en-US")} USD`;
+  }
+
+  return [
+    `⏱ <b>Jadwal ${scheduleKindLabel(kind)} #${row.id}</b>`,
+    detail,
+    "",
+    ...scheduleLines(row.cron_expr, row.interval_min, row.next_run_at),
+    "",
+    "<i>Pilih interval, ketik cron 5 field, atau matikan cron.</i>",
+  ].join("\n");
+}
+
+function scheduleEditorKeyboard(kind: ScheduleKind, row: ScheduleRow): any {
+  const intervals = kind === "monitor" ? [1, 5, 15, 60] : [5, 15, 60];
+  const rows: any[] = [
+    intervals.map((minutes) => ({
+      text: `${minutes}m`,
+      callback_data: `sched_int:${kind}:${row.id}:${minutes}`,
+    })),
+    [{ text: "✍️ Ketik cron", callback_data: `sched_set:${kind}:${row.id}` }],
+  ];
+
+  const controls: any[] = [];
+  if (row.cron_expr) {
+    controls.push({ text: "Matikan cron", callback_data: `sched_off:${kind}:${row.id}` });
+  }
+  controls.push({ text: "⬅️ Kembali", callback_data: scheduleBackData(kind, row.id) });
+  rows.push(controls);
+
+  return { inline_keyboard: rows };
+}
+
+export async function handleScheduleCallback(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  userId: number,
+  data: string,
+): Promise<boolean> {
+  const [action, rawKind, rawId, rawValue] = data.split(":");
+  if (!["sched_open", "sched_set", "sched_int", "sched_off"].includes(action)) return false;
+
+  const kind = rawKind as ScheduleKind;
+  if (!SCHEDULE_TABLES[kind]) return false;
+  const id = Number(rawId);
+  if (!Number.isFinite(id)) return false;
+
+  const row = await getScheduleRow(env, kind, id, userId);
+  if (!row) {
+    await editMessage(env, chatId, messageId, `❌ ${scheduleKindLabel(kind)} #${id} tidak ditemukan.`, {
+      keyboard: backMenu(),
+    });
+    return true;
+  }
+
+  if (action === "sched_open") {
+    await editMessage(env, chatId, messageId, scheduleEditorText(kind, row), {
+      keyboard: scheduleEditorKeyboard(kind, row),
+    });
+    return true;
+  }
+
+  if (action === "sched_int") {
+    const interval = validateInterval(kind, Number(rawValue));
+    if (interval === null) return true;
+    const table = SCHEDULE_TABLES[kind];
+    await qRun(
+      env,
+      `UPDATE ${table} SET interval_min = ?, cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?`,
+      interval,
+      id,
+      userId,
+    );
+    row.interval_min = interval;
+    row.cron_expr = null;
+    row.next_run_at = null;
+    await editMessage(env, chatId, messageId, scheduleEditorText(kind, row), {
+      keyboard: scheduleEditorKeyboard(kind, row),
+    });
+    return true;
+  }
+
+  if (action === "sched_off") {
+    const table = SCHEDULE_TABLES[kind];
+    await qRun(
+      env,
+      `UPDATE ${table} SET cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?`,
+      id,
+      userId,
+    );
+    row.cron_expr = null;
+    row.next_run_at = null;
+    await editMessage(env, chatId, messageId, scheduleEditorText(kind, row), {
+      keyboard: scheduleEditorKeyboard(kind, row),
+    });
+    return true;
+  }
+
+  await setState(env, userId, "schedule", { kind, id } satisfies ScheduleTarget);
+  await sendMessage(
+    env,
+    chatId,
+    `⏱ <b>Jadwal ${scheduleKindLabel(kind)} #${id}</b>\n\n` +
+      "Kirim cron 5 field atau angka menit.\n" +
+      "Contoh: <code>*/10 * * * *</code> atau <code>15</code>.\n\n" +
+      "<i>Ketik /cancel untuk batal.</i>",
+    { keyboard: backMenu() },
+  );
+  return true;
+}
+
+export async function applyScheduleInput(ctx: Ctx, target: ScheduleTarget, raw: string): Promise<void> {
+  const kind = target.kind;
+  const table = SCHEDULE_TABLES[kind];
+  if (!table) {
+    await sendMessage(ctx.env, ctx.chatId, "❌ Jenis jadwal tidak dikenal.");
+    return;
+  }
+
+  const row = await getScheduleRow(ctx.env, kind, target.id, ctx.userId);
+  if (!row) {
+    await sendMessage(ctx.env, ctx.chatId, `❌ ${scheduleKindLabel(kind)} #${target.id} tidak ditemukan.`);
+    return;
+  }
+
+  const value = cleanScheduleInput(raw);
+  if (!value) {
+    await sendMessage(
+      ctx.env,
+      ctx.chatId,
+      "❌ Input kosong. Buka daftar lalu klik ⏱ untuk mengatur jadwal lagi.",
+    );
+    return;
+  }
+
+  if (value.toLowerCase() === "off") {
+    await qRun(
+      ctx.env,
+      `UPDATE ${table} SET cron_expr = NULL, next_run_at = NULL WHERE id = ? AND user_id = ?`,
+      target.id,
+      ctx.userId,
+    );
+    const updated = (await getScheduleRow(ctx.env, kind, target.id, ctx.userId)) ?? row;
+    await sendMessage(
+      ctx.env,
+      ctx.chatId,
+      `✅ Cron ${scheduleKindLabel(kind)} #${target.id} dimatikan.\n\n${scheduleEditorText(kind, updated)}`,
+      { keyboard: scheduleEditorKeyboard(kind, updated) },
+    );
+    return;
+  }
+
+  const parsed = await resolveSchedule(ctx.env, kind, value);
+  if (!parsed.schedule) {
+    await sendMessage(
+      ctx.env,
+      ctx.chatId,
+      `❌ ${parsed.error ?? "Jadwal tidak valid."}\n\nBuka daftar lalu klik ⏱ untuk mencoba lagi.`,
+    );
+    return;
+  }
+
+  const schedule = parsed.schedule;
+  const now = Date.now();
+  const nextRunAt = schedule.cron ? nextRunAfter(schedule.cron, now) : null;
+  await qRun(
+    ctx.env,
+    `UPDATE ${table} SET interval_min = ?, cron_expr = ?, next_run_at = ? WHERE id = ? AND user_id = ?`,
+    schedule.minutes,
+    schedule.cron,
+    nextRunAt,
+    target.id,
+    ctx.userId,
+  );
+
+  const updated = (await getScheduleRow(ctx.env, kind, target.id, ctx.userId)) ?? row;
+  await sendMessage(
+    ctx.env,
+    ctx.chatId,
+    `✅ Jadwal ${scheduleKindLabel(kind)} #${target.id} diperbarui.\n\n${scheduleEditorText(kind, updated)}`,
+    { keyboard: scheduleEditorKeyboard(kind, updated) },
+  );
+}
+
 function statusIcon(status: string | null | undefined): string {
   if (status === "up") return "🟢";
   if (status === "protected") return "🟡";
@@ -448,9 +683,12 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
   for (const row of rows) {
     const title = row.title || shortUrl(row.url);
     lines.push(`<b>#${row.id}</b> ${esc(title)} · ${scheduleLabel(row.cron_expr, row.interval_min)}`);
-    keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `rss_del:${row.id}` }]);
+    keyboard.push([
+      { text: `⏱ #${row.id}`, callback_data: `sched_open:rss:${row.id}` },
+      { text: `🗑 #${row.id}`, callback_data: `rss_del:${row.id}` },
+    ]);
   }
-  lines.push("", "<i>Ubah: /rss every &lt;id&gt; &lt;menit&gt; · /rss cron &lt;id&gt; &lt;expr|off&gt;</i>");
+  lines.push("", "<i>Klik ⏱ untuk atur jadwal item. Bisa juga: /rss every &lt;id&gt; &lt;menit&gt; · /rss cron &lt;id&gt; &lt;expr|off&gt;</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 
@@ -557,6 +795,7 @@ function monitorDetailKeyboard(row: MonitorRow): any {
         { text: "15m", callback_data: `mon_every:${row.id}:15` },
         { text: "60m", callback_data: `mon_every:${row.id}:60` },
       ],
+      [{ text: "✍️ Set Cron", callback_data: `sched_open:monitor:${row.id}` }],
       [
         {
           text: row.paused ? "▶️ Aktifkan" : "⏸ Jeda",
@@ -989,9 +1228,12 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
         row.interval_min,
       )}`,
     );
-    keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `alert_del:${row.id}` }]);
+    keyboard.push([
+      { text: `⏱ #${row.id}`, callback_data: `sched_open:alert:${row.id}` },
+      { text: `🗑 #${row.id}`, callback_data: `alert_del:${row.id}` },
+    ]);
   }
-  lines.push("", "<i>Ubah: /alert every &lt;id&gt; &lt;menit&gt; · /alert cron &lt;id&gt; &lt;expr|off&gt;</i>");
+  lines.push("", "<i>Klik ⏱ untuk atur jadwal item. Bisa juga: /alert every &lt;id&gt; &lt;menit&gt; · /alert cron &lt;id&gt; &lt;expr|off&gt;</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 

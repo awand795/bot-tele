@@ -340,7 +340,7 @@ export async function cmdCron(ctx: Ctx): Promise<void> {
       "<b>Tes ekspresi</b>",
       "<code>/cron test 0 9 * * 1-5</code>",
       "",
-      "<i>Per item: /monitor cron, /rss cron, /alert cron. Semua jadwal WIB.</i>",
+      "<i>Per item: buka daftar Monitor/RSS/Alert lalu klik ⏱. Semua jadwal WIB.</i>",
     ].join("\n"),
   );
 }

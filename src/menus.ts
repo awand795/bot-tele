@@ -251,7 +251,8 @@ export const MONITOR_TEXT =
   "Cron: <code>/monitor add &lt;url&gt; */10 * * * *</code>\n" +
   "Ubah cron: <code>/monitor cron 2 0 9 * * 1-5</code>\n" +
   "Matikan cron: <code>/monitor cron 2 off</code>\n\n" +
-  "Buka daftar monitor → klik item untuk cek sekarang, ubah jadwal, jeda, atau hapus.\n\n" +
+  "Buka /monitor, /rss, atau /alert → klik ⏱ untuk atur jadwal item.\n" +
+  "Di detail monitor: cek sekarang, Set Cron, jeda, atau hapus.\n\n" +
   "<i>Cron 5 field (menit jam tanggal bulan hari), zona WIB. Contoh: <code>*/5 * * * *</code>, <code>0 9 * * 1-5</code>.</i>\n" +
   "<i>Status 🟡 = server merespons tapi akses dibatasi (401/403/429).</i>";
 

@@ -89,7 +89,8 @@ Format pengingat (WIB):
 - Cron Worker tetap jalan **tiap menit**. Item interval dicek jika `last_checked + interval_min` sudah lewat; item cron dicek jika `next_run_at` sudah lewat.
 - Interval per item: `/monitor every <id> <menit>`, `/rss every <id> <menit>`, `/alert every <id> <menit>`.
 - Cron per item: `/monitor cron <id> <expr>`, `/rss cron <id> <expr>`, `/alert cron <id> <expr>`. Pakai `off` untuk kembali ke interval.
-- `/monitor` tanpa argumen menampilkan daftar; klik item untuk **cek sekarang**, pilih **1m/5m/15m/60m**, **jeda/aktifkan**, atau hapus.
+- **Picker jadwal:** buka `/monitor`, `/rss`, atau `/alert`, lalu klik tombol **⏱** pada item. Di detail monitor juga ada tombol **✍️ Set Cron**. Editor menampilkan jadwal aktif, waktu berikutnya, pilihan **1m/5m/15m/60m**, **Ketik cron**, dan **Matikan cron**. Hanya item yang dipilih yang berubah.
+- `/monitor` tanpa argumen menampilkan daftar; klik item untuk **cek sekarang**, **Set Cron**, **jeda/aktifkan**, atau hapus.
 - Default item baru diatur owner lewat `/cron` dan `/cron set monitor|rss|alert <menit|expr>`.
 - Status uptime: 🟢 **up** (2xx–3xx), 🟡 **terproteksi** (401/403/429 — server merespons tapi akses dibatasi), 🔴 **down** (5xx, timeout, 4xx lain).
 - Harga: CoinGecko, fallback Binance jika kena rate limit.
