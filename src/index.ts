@@ -1,7 +1,7 @@
 import type { Env } from "./env";
 import { handleUpdate } from "./router";
 import { verifyPayload } from "./crypto";
-import { resolveStream, type StreamPayload } from "./resolve";
+import { isMediaContentType, resolveStream, type StreamPayload } from "./resolve";
 import { detectPlatform, extractMedia } from "./extract";
 import { browseTeraBox, normalizeShare } from "./extract/terabox";
 import { signedMediaUrl, deliverMedia } from "./sender";
@@ -76,9 +76,18 @@ export default {
       if (!payload) return new Response("Link kedaluwarsa.", { status: 410 });
 
       try {
-        const resolved = await resolveStream(env, payload as unknown as StreamPayload, request.headers.get("Range"));
+        const streamPayload = payload as unknown as StreamPayload;
+        const resolved = await resolveStream(env, streamPayload, request.headers.get("Range"));
         if (!resolved.response.ok && resolved.response.status !== 206) {
+          await resolved.response.body?.cancel().catch(() => {});
           return new Response(`Gagal mengambil file (upstream ${resolved.response.status}).`, { status: 502 });
+        }
+        if (!isMediaContentType(streamPayload.kind, resolved.contentType)) {
+          await resolved.response.body?.cancel().catch(() => {});
+          return new Response(
+            `Sumber mengirim ${resolved.contentType || "respons tak dikenal"}, bukan media.`,
+            { status: 502 },
+          );
         }
 
         const headers = new Headers();

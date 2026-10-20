@@ -3,7 +3,7 @@ import { LIMITS } from "./env";
 import { signPayload } from "./crypto";
 import { esc, sendMediaByStream, sendMediaByUrl, sendMessage, TgError } from "./telegram";
 import { humanSize, type Media } from "./extract/types";
-import { payloadForMedia, resolveStream } from "./resolve";
+import { isMediaContentType, MediaFetchError, payloadForMedia, resolveStream } from "./resolve";
 
 export async function signedMediaUrl(env: Env, origin: string, media: Media, ttl = LIMITS.LINK_TTL): Promise<string> {
   const token = await signPayload(env, payloadForMedia(media) as unknown as Record<string, unknown>, ttl);
@@ -75,6 +75,26 @@ export async function deliverMedia(
 
   try {
     const resolved = await resolveStream(env, payloadForMedia(media), null);
+    const status = resolved.response.status;
+
+    if (!resolved.response.ok && status !== 206) {
+      await resolved.response.body?.cancel().catch(() => {});
+      throw new MediaFetchError(
+        `Sumber media membalas HTTP ${status}.`,
+        status,
+        resolved.contentType,
+      );
+    }
+
+    if (!isMediaContentType(media.kind, resolved.contentType)) {
+      await resolved.response.body?.cancel().catch(() => {});
+      throw new MediaFetchError(
+        `Sumber mengirim ${resolved.contentType || "respons tak dikenal"}, bukan ${media.kind}.`,
+        status,
+        resolved.contentType,
+      );
+    }
+
     const length = media.size ?? resolved.size;
     if (!resolved.response.body || !length) throw new Error("ukuran file tidak diketahui");
     if (length > LIMITS.UPLOAD_MAX) {
@@ -84,6 +104,7 @@ export async function deliverMedia(
     await sendMediaByStream(env, chatId, target, resolved.response.body, length);
     return { mode: "upload" };
   } catch (err) {
+    if (err instanceof MediaFetchError) throw err;
     if (err instanceof TgError) console.warn("upload delivery failed", err.description);
     else console.warn("upload delivery failed", (err as Error).message);
     await linkMessage(env, chatId, media, url, "⚠️ Gagal upload langsung, pakai link berikut.");

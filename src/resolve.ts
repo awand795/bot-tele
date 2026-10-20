@@ -1,17 +1,57 @@
 import type { Env } from "./env";
-import type { Media } from "./extract/types";
+import type { Media, MediaKind } from "./extract/types";
 import { resolveYtStream, VR_UA } from "./extract/youtube";
 import { getTeraBoxDownload, TB_UA } from "./extract/terabox";
 
 export type StreamPayload =
-  | { t: "u"; url: string; headers?: Record<string, string>; filename?: string }
-  | { t: "yt"; id: string; itag: number; filename?: string }
-  | { t: "tb"; share: string; fsId: string; filename?: string };
+  | { t: "u"; url: string; headers?: Record<string, string>; filename?: string; kind?: MediaKind }
+  | { t: "yt"; id: string; itag: number; filename?: string; kind?: MediaKind }
+  | { t: "tb"; share: string; fsId: string; filename?: string; kind?: MediaKind };
 
 export function payloadForMedia(media: Media): StreamPayload {
-  if (media.yt) return { t: "yt", id: media.yt.id, itag: media.yt.itag, filename: media.filename };
-  if (media.tb) return { t: "tb", share: media.tb.share, fsId: media.tb.fsId, filename: media.filename };
-  return { t: "u", url: media.url, headers: media.headers, filename: media.filename };
+  if (media.yt) return { t: "yt", id: media.yt.id, itag: media.yt.itag, filename: media.filename, kind: media.kind };
+  if (media.tb) return { t: "tb", share: media.tb.share, fsId: media.tb.fsId, filename: media.filename, kind: media.kind };
+  return { t: "u", url: media.url, headers: media.headers, filename: media.filename, kind: media.kind };
+}
+
+/** Raised when the upstream source answers with an error page instead of media. */
+export class MediaFetchError extends Error {
+  status?: number;
+  contentType: string;
+
+  constructor(message: string, status?: number, contentType = "") {
+    super(message);
+    this.name = "MediaFetchError";
+    this.status = status;
+    this.contentType = contentType;
+  }
+}
+
+const TEXT_CONTENT =
+  /^(text\/|application\/(?:json|xml|xhtml\+xml|problem\+json|javascript))/i;
+
+/**
+ * Guard against uploading HTML/JSON error pages as media.
+ * Unknown/octet-stream content is allowed so streams without a useful
+ * content-type still work.
+ */
+export function isMediaContentType(kind: MediaKind | undefined, contentType: string): boolean {
+  const type = (contentType || "").split(";")[0].trim().toLowerCase();
+  if (!type || type === "application/octet-stream") return true;
+  if (TEXT_CONTENT.test(type)) return false;
+
+  switch (kind) {
+    case "video":
+      return type.startsWith("video/");
+    case "audio":
+      return type.startsWith("audio/") || type === "video/mp4";
+    case "photo":
+      return type.startsWith("image/");
+    case "document":
+      return !type.startsWith("text/");
+    default:
+      return true;
+  }
 }
 
 const DEFAULT_UA =

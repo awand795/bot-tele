@@ -33,9 +33,9 @@ export async function extractMedia(env: Env, input: string): Promise<ExtractResu
   const platform = detectPlatform(url);
   switch (platform) {
     case "tiktok":
-      return extractTikTok(url);
+      return extractTikTok(env, url);
     case "instagram":
-      return extractInstagram(url.replace(/^https?:\/\/(www\.)?ddinstagram\.com/i, "https://www.instagram.com"));
+      return extractInstagram(env, url);
     case "facebook":
       return extractFacebook(url);
     case "youtube":

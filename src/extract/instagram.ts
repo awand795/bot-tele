@@ -1,8 +1,11 @@
+import type { Env } from "../env";
 import type { ExtractResult, Media } from "./types";
 
 const WEB_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 const APP_UA = "Instagram 219.0.0.12.117 Android (33/13; 420dpi; 1080x2400; samsung; SM-S911B; dm3q; qcom; en_US)";
+
+const SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 export function parseInstagramCode(input: string): string | null {
   try {
@@ -13,6 +16,18 @@ export function parseInstagramCode(input: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Instagram shortcodes are base64-ish encodings of the numeric media id. */
+export function shortcodeToMediaId(code: string): string | null {
+  if (!code) return null;
+  let id = 0n;
+  for (const char of code) {
+    const value = SHORTCODE_ALPHABET.indexOf(char);
+    if (value < 0) return null;
+    id = id * 64n + BigInt(value);
+  }
+  return id.toString();
 }
 
 function unescapeJsonUrl(raw: string): string {
@@ -31,6 +46,11 @@ function firstUrl(raw?: string): string | undefined {
   return /^https?:\/\//.test(value) ? value : undefined;
 }
 
+function cookieValue(cookie: string, name: string): string | undefined {
+  const match = cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  return match?.[1];
+}
+
 interface IgItem {
   media_type?: number;
   video_versions?: Array<{ url: string; width?: number; height?: number }>;
@@ -38,6 +58,35 @@ interface IgItem {
   carousel_media?: IgItem[];
   caption?: { text?: string };
   code?: string;
+}
+
+function instagramHeaders(env: Env, code: string, app: boolean): Record<string, string> {
+  const headers: Record<string, string> = {
+    "User-Agent": app ? APP_UA : WEB_UA,
+    Accept: app ? "*/*" : "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    Referer: `https://www.instagram.com/p/${code}/`,
+  };
+
+  if (app) {
+    headers["x-ig-app-id"] = "1217981644879628";
+    headers["X-IG-Capabilities"] = "3brTvw==";
+    headers["X-IG-Connection-Type"] = "WIFI";
+  } else {
+    headers["x-ig-app-id"] = "936619743392459";
+    headers["x-ig-www-claim"] = "0";
+    headers["x-asbd-id"] = "129477";
+    headers["X-Requested-With"] = "XMLHttpRequest";
+  }
+
+  const cookie = env.INSTAGRAM_COOKIE?.trim();
+  if (cookie) {
+    headers.Cookie = cookie;
+    const csrf = cookieValue(cookie, "csrftoken");
+    if (csrf) headers["x-csrftoken"] = csrf;
+  }
+
+  return headers;
 }
 
 function buildFromItems(items: IgItem[]): { medias: Media[]; caption?: string } {
@@ -82,34 +131,34 @@ function buildFromItems(items: IgItem[]): { medias: Media[]; caption?: string } 
   return { medias, caption };
 }
 
-async function tryWebApi(code: string): Promise<IgItem[] | null> {
-  const res = await fetch(`https://www.instagram.com/api/v1/media/${code}/info/`, {
-    headers: {
-      "User-Agent": WEB_UA,
-      Accept: "*/*",
-      "x-ig-app-id": "936619743392459",
-      "Accept-Language": "en-US,en;q=0.9",
-      Referer: `https://www.instagram.com/p/${code}/`,
-    },
-  });
-  if (!res.ok) return null;
-  const json: any = await res.json().catch(() => null);
-  return json?.items?.length ? (json.items as IgItem[]) : null;
-}
+async function fetchInfo(env: Env, code: string, app: boolean): Promise<IgItem[]> {
+  const mediaId = shortcodeToMediaId(code);
+  if (!mediaId) throw new Error("Shortcode Instagram tidak valid.");
 
-async function tryAppApi(code: string): Promise<IgItem[] | null> {
-  const res = await fetch(`https://i.instagram.com/api/v1/media/${code}/info/`, {
-    headers: {
-      "User-Agent": APP_UA,
-      Accept: "*/*",
-      "x-ig-app-id": "1217981644879628",
-      "Accept-Language": "en-US",
-    },
+  const host = app ? "https://i.instagram.com" : "https://www.instagram.com";
+  const res = await fetch(`${host}/api/v1/media/${mediaId}/info/`, {
+    headers: instagramHeaders(env, code, app),
   });
-  if (!res.ok) return null;
+
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body: any = await res.json();
+      detail = body?.message || body?.error_title || "";
+    } catch {
+      /* body is often empty */
+    }
+    throw new Error(`Instagram ${app ? "app" : "web"} API HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    throw new Error(`Instagram ${app ? "app" : "web"} API tidak mengembalikan JSON.`);
+  }
+
   const json: any = await res.json().catch(() => null);
-  if (json?.items?.length) return json.items as IgItem[];
-  return null;
+  if (!json?.items?.length) throw new Error("Instagram tidak mengembalikan media.");
+  return json.items as IgItem[];
 }
 
 async function tryEmbed(code: string): Promise<{ medias: Media[]; caption?: string; title?: string } | null> {
@@ -155,23 +204,23 @@ async function tryEmbed(code: string): Promise<{ medias: Media[]; caption?: stri
   return { medias, caption, title };
 }
 
-export async function extractInstagram(url: string): Promise<ExtractResult> {
+export async function extractInstagram(env: Env, url: string): Promise<ExtractResult> {
   const code = parseInstagramCode(url);
   if (!code) throw new Error("Link Instagram tidak valid.");
 
+  const errors: string[] = [];
   let items: IgItem[] | null = null;
-  let lastError: unknown = null;
 
-  for (const attempt of [tryWebApi, tryAppApi]) {
+  for (const attempt of [() => fetchInfo(env, code, false), () => fetchInfo(env, code, true)]) {
     try {
-      items = await attempt(code);
-      if (items) break;
+      items = await attempt();
+      if (items.length) break;
     } catch (err) {
-      lastError = err;
+      errors.push(err instanceof Error ? err.message : String(err));
     }
   }
 
-  if (items) {
+  if (items?.length) {
     const { medias, caption } = buildFromItems(items);
     if (medias.length) {
       const title = (caption || `Instagram ${code}`).slice(0, 120);
@@ -200,9 +249,15 @@ export async function extractInstagram(url: string): Promise<ExtractResult> {
     };
   }
 
-  const detail = lastError instanceof Error ? ` (${lastError.message})` : "";
+  if (!env.INSTAGRAM_COOKIE?.trim()) {
+    throw new Error(
+      "Instagram butuh cookie sesi. Set secret INSTAGRAM_COOKIE (lihat README) lalu coba lagi.",
+    );
+  }
+
+  const detail = errors.length ? ` (${errors[0]})` : "";
   throw new Error(
-    `Instagram menolak permintaan${detail}. Biasanya karena rate limit/platform. Coba lagi beberapa saat atau pakai link lain.`,
+    `Instagram menolak permintaan${detail}. Cookie mungkin kedaluwarsa; ambil ulang cookie lalu simpan lagi.`,
   );
 }
 

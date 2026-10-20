@@ -6,6 +6,10 @@ export interface Env {
   AI: Ai;
   /** Optional TeraBox account cookie. Without it TeraBox share links hit a captcha. */
   TERABOX_COOKIE?: string;
+  /** Optional Instagram session cookie. Needed for reliable public media access. */
+  INSTAGRAM_COOKIE?: string;
+  /** Optional TikTok session cookie. Needed for reliable public media access. */
+  TIKTOK_COOKIE?: string;
 }
 
 export const LIMITS = {

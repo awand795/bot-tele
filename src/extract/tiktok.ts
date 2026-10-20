@@ -1,3 +1,4 @@
+import type { Env } from "../env";
 import type { ExtractResult, Media } from "./types";
 
 const UA =
@@ -133,12 +134,58 @@ interface TikTokItem {
   imagePost?: { images?: Array<{ imageURL?: { urlList?: string[] } }> };
 }
 
-async function viaPage(url: string): Promise<ExtractResult> {
+function parseVideoId(input: string): string | null {
+  try {
+    const u = new URL(input);
+    const match = u.pathname.match(/\/(?:video|photo)\/(\d+)/);
+    if (match) return match[1];
+    return u.searchParams.get("item_id") || u.searchParams.get("aweme_id");
+  } catch {
+    return null;
+  }
+}
+
+function fromItem(item: TikTokItem, url: string): ExtractResult {
+  const images = item.imagePost?.images
+    ?.map((img) => img.imageURL?.urlList?.[0])
+    .filter((v): v is string => Boolean(v));
+
+  const videoUrl =
+    item.video?.playAddr ||
+    item.video?.downloadAddr ||
+    item.video?.bitrateInfo?.map((b) => b.PlayAddr?.UrlList?.[0]).find(Boolean);
+
+  if (!images?.length && !videoUrl) throw new Error("Media TikTok tidak ditemukan.");
+
+  const author = item.author?.uniqueId ? `@${item.author.uniqueId}` : item.author?.nickname ?? "";
+  const title = (item.desc || `TikTok ${author}`).trim();
+
+  return buildResult({
+    id: String(item.id ?? Date.now()),
+    title,
+    author,
+    cover: item.video?.dynamicCover || item.video?.cover,
+    video: images?.length
+      ? undefined
+      : { url: videoUrl!, duration: item.video?.duration, width: item.video?.width, height: item.video?.height },
+    images: images?.length ? images : undefined,
+    music: item.music?.playUrl,
+    url,
+  });
+}
+
+function cookieHeader(env: Env): Record<string, string> {
+  const cookie = env.TIKTOK_COOKIE?.trim();
+  return cookie ? { Cookie: cookie } : {};
+}
+
+async function viaPage(env: Env, url: string): Promise<ExtractResult> {
   const res = await fetch(url, {
     headers: {
       "User-Agent": UA,
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
+      ...cookieHeader(env),
     },
     redirect: "follow",
   });
@@ -155,42 +202,54 @@ async function viaPage(url: string): Promise<ExtractResult> {
     scope["webapp.reflow.video.detail"]?.itemInfo?.itemStruct;
 
   if (!item) throw new Error("Postingan TikTok tidak tersedia (mungkin privat)");
-
-  const images = item.imagePost?.images
-    ?.map((img) => img.imageURL?.urlList?.[0])
-    .filter((v): v is string => Boolean(v));
-
-  const videoUrl =
-    item.video?.playAddr ||
-    item.video?.bitrateInfo?.map((b) => b.PlayAddr?.UrlList?.[0]).find(Boolean) ||
-    item.video?.downloadAddr;
-
-  const author = item.author?.uniqueId ? `@${item.author.uniqueId}` : item.author?.nickname ?? "";
-  const title = (item.desc || `TikTok ${author}`).trim();
-
-  return buildResult({
-    id: String(item.id ?? Date.now()),
-    title,
-    author,
-    cover: item.video?.dynamicCover || item.video?.cover,
-    video: images?.length ? undefined : { url: videoUrl!, duration: item.video?.duration, width: item.video?.width, height: item.video?.height },
-    images: images?.length ? images : undefined,
-    music: item.music?.playUrl,
-    url,
-  });
+  return fromItem(item, url);
 }
 
-export async function extractTikTok(url: string): Promise<ExtractResult> {
+async function viaWebApi(env: Env, url: string): Promise<ExtractResult> {
+  const id = parseVideoId(url);
+  if (!id) throw new Error("ID video TikTok tidak ditemukan");
+
+  const res = await fetch(`https://www.tiktok.com/api/item/detail/?itemId=${encodeURIComponent(id)}`, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.9",
+      Referer: url,
+      "X-Requested-With": "XMLHttpRequest",
+      ...cookieHeader(env),
+    },
+  });
+  if (!res.ok) throw new Error(`TikTok API membalas ${res.status}`);
+
+  const json: any = await res.json().catch(() => null);
+  const item: TikTokItem | undefined =
+    json?.itemInfo?.itemStruct ??
+    json?.itemInfo?.itemStructV2?.itemStruct ??
+    json?.aweme_detail;
+  if (!item) throw new Error("Data TikTok tidak ditemukan di API");
+  return fromItem(item, url);
+}
+
+export async function extractTikTok(env: Env, url: string): Promise<ExtractResult> {
+  const attempts: Array<(env: Env, url: string) => Promise<ExtractResult>> = [
+    (_env, target) => viaTikwm(target),
+    viaWebApi,
+    viaPage,
+  ];
   const errors: string[] = [];
-  for (const attempt of [viaTikwm, viaPage]) {
+
+  for (const attempt of attempts) {
     try {
-      return await attempt(url);
+      return await attempt(env, url);
     } catch (err) {
       errors.push(err instanceof Error ? err.message : String(err));
     }
   }
-  if (errors.some((e) => /limit/i.test(e))) {
-    throw new Error("Server TikTok sedang sibuk (rate limit). Coba lagi 5–10 detik.");
+
+  if (errors.some((e) => /limit|403|401|login/i.test(e))) {
+    throw new Error(
+      "TikTok membatasi akses server ini. Coba lagi nanti atau set TIKTOK_COOKIE (lihat README).",
+    );
   }
   throw new Error(errors[0] || "Gagal mengambil media TikTok.");
 }

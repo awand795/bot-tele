@@ -157,7 +157,7 @@ Binding:
 | `BOT_KV` | state flow, cache YouTube, rate limit, dedupe update, chat registry |
 | `DB` (D1) | user, vault index, notes, todos, reminders, pastes, feeds, monitors, alerts, AI usage, stats, audit, settings |
 | `AI` | Workers AI |
-| `secrets` | `BOT_TOKEN`, `WEBHOOK_SECRET`, `TERABOX_COOKIE` (opsional) |
+| `secrets` | `BOT_TOKEN`, `WEBHOOK_SECRET`, `TERABOX_COOKIE` / `INSTAGRAM_COOKIE` / `TIKTOK_COOKIE` (opsional) |
 
 ### Signed URL
 
@@ -289,10 +289,14 @@ Tidak perlu API key.
 ### 4. Set secret
 
 ```powershell
-"<BOT_TOKEN>"      | npx wrangler secret put BOT_TOKEN
-"<WEBHOOK_SECRET>" | npx wrangler secret put WEBHOOK_SECRET
-"<TERABOX_COOKIE>" | npx wrangler secret put TERABOX_COOKIE   # opsional
+"<BOT_TOKEN>"        | npx wrangler secret put BOT_TOKEN
+"<WEBHOOK_SECRET>"   | npx wrangler secret put WEBHOOK_SECRET
+"<TERABOX_COOKIE>"   | npx wrangler secret put TERABOX_COOKIE     # opsional
+"<INSTAGRAM_COOKIE>" | npx wrangler secret put INSTAGRAM_COOKIE   # opsional, disarankan
+"<TIKTOK_COOKIE>"    | npx wrangler secret put TIKTOK_COOKIE      # opsional
 ```
+
+Cookie Instagram/TikTok diambil dari browser yang sudah login, lalu disimpan sebagai **satu baris** header `Cookie`. Jangan decode `%3A` pada `sessionid`. Cookie ini punya akses penuh ke akun, jadi gunakan akun cadangan dan rotasi jika sudah tidak dipakai.
 
 `WEBHOOK_SECRET` string acak 32 karakter (`[A-Za-z0-9_-]`). Dipakai untuk:
 
@@ -338,6 +342,10 @@ Setelah itu ketik `@adnawaa_bot <judul/link>` di chat mana pun.
 ```
 BOT_TOKEN=...
 WEBHOOK_SECRET=...
+# opsional
+# INSTAGRAM_COOKIE=...
+# TIKTOK_COOKIE=...
+# TERABOX_COOKIE=...
 ```
 
 ```powershell
@@ -377,13 +385,13 @@ Contoh:
 
 TeraBox menolak request anonim dengan captcha (`verify_v2`). Alternatif pihak ketiga juga memblokir IP Worker. Supaya aktif, isi secret `TERABOX_COOKIE` dengan cookie akun TeraBox.
 
-### 2. Instagram sering `429`
+### 2. Instagram butuh cookie
 
-Instagram membatasi IP datacenter. Bot sudah mencoba web API, app API, dan embed; jika semuanya gagal, tampil pesan error.
+Instagram membatasi IP datacenter (`429`) dan API app sering membalas `login_required` (`403`). Bot mengubah shortcode menjadi media ID numerik, lalu memakai `INSTAGRAM_COOKIE` untuk web API/app API. Tanpa cookie, fallback embed tetap dicoba; jika gagal, bot menampilkan pesan error.
 
-### 3. TikTok `Free Api Limit: 1 request/second`
+### 3. TikTok sering `403` / `Free Api Limit`
 
-Fallback scrape `__UNIVERSAL_DATA_FOR_REHYDRATION__` sudah aktif, jadi video/foto/audio tetap bisa diambil.
+TikWM membatasi IP Worker. Fallback scrape `__UNIVERSAL_DATA_FOR_REHYDRATION__` tetap aktif, tetapi URL CDN TikTok bisa menolak IP Worker. Isi `TIKTOK_COOKIE` untuk membantu. Kalau sumber tetap `403`, bot menampilkan error yang jelas dan **tidak** mengunggah halaman error sebagai video.
 
 ### 4. YouTube hanya 360p
 
