@@ -112,7 +112,7 @@ export async function cmdStatus(ctx: Ctx): Promise<void> {
     lines.push(`🔴 KV: ${esc((err as Error).message)}`);
   }
 
-  lines.push(ctx.env.AI ? "🟢 Workers AI: terpasang" : "🔴 Workers AI: tidak ada binding");
+  lines.push(ctx.env.AI ? "🟢 AI: aktif" : "🔴 AI: tidak aktif");
 
   try {
     const info: any = await tg(ctx.env, "getWebhookInfo");

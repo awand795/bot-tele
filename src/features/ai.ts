@@ -102,7 +102,7 @@ export async function cmdAi(ctx: Ctx): Promise<void> {
     await sendMessage(
       ctx.env,
       ctx.chatId,
-      "🤖 <b>AI Chat</b>\n\n<code>/ai jelaskan apa itu cloudflare workers</code>\n\n" +
+      "🤖 <b>AI Chat</b>\n\n<code>/ai jelaskan apa itu machine learning</code>\n\n" +
         `<i>Kuota ${LIMITS.AI_PER_DAY} request/hari.</i>`,
     );
     return;

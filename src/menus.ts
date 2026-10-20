@@ -135,7 +135,7 @@ export function settingMenu(isOwner: boolean): InlineKeyboardMarkup {
 
 export const START_TEXT =
   "<b>👋 Selamat datang di Adnawaa Private Bot</b>\n\n" +
-  "Asisten pribadi serba bisa, jalan 100% di Cloudflare Workers.\n\n" +
+  "Asisten pribadi serba bisa dalam satu bot.\n\n" +
   "⬇️ <b>Download</b> — TeraBox, TikTok, Instagram, Facebook, YouTube\n" +
   "🧰 <b>Tools</b> — QR, cuaca, jadwal sholat, kurs, lirik, paste\n" +
   "🗂 <b>Vault</b> — simpan file, catatan, todo, pengingat\n" +
@@ -202,7 +202,7 @@ export const YOUTUBE_PROMPT =
 export const STORY_TEXT =
   "<b>👀 Story</b>\n\n" +
   "Fitur ini sedang disiapkan.\n\n" +
-  "Story Instagram/Facebook/TikTok butuh sesi login dan saat ini belum bisa dijalankan penuh di Cloudflare Worker.";
+  "Story Instagram/Facebook/TikTok butuh sesi login dan saat ini belum bisa dijalankan penuh.";
 
 export const TOOLS_TEXT =
   "<b>🧰 Tools</b>\n\n" +
@@ -227,7 +227,7 @@ export const VAULT_TEXT =
 
 export const AI_TEXT =
   "<b>🤖 AI</b>\n\n" +
-  "Ditenagai Cloudflare Workers AI (tanpa API key eksternal).\n\n" +
+  "Ditenagai AI bawaan bot (tanpa API key eksternal).\n\n" +
   "💬 <code>/ai jelaskan quantum computing</code>\n" +
   "🧾 <code>/ringkas https://url-artikel</code>\n" +
   "🌐 <code>/tr en selamat pagi</code>\n" +
@@ -242,7 +242,7 @@ export const MONITOR_TEXT =
   "📈 <b>Uptime</b> — <code>/monitor add https://example.com</code>\n" +
   "🔔 <b>Harga</b> — <code>/alert BTC &gt; 100000</code>\n" +
   "🐙 <b>GitHub</b> — <code>/gh owner/repo</code>\n\n" +
-  "<i>Pengecekan otomatis lewat cron Cloudflare (RSS 10 menit, uptime 5 menit, harga 15 menit).</i>";
+  "<i>Pengecekan otomatis lewat cron (RSS 10 menit, uptime 5 menit, harga 15 menit).</i>";
 
 export const SETTING_TEXT =
   "<b>⚙️ Setting</b>\n\n" +

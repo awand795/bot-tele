@@ -108,7 +108,7 @@ function pwdOf(share: string): string | undefined {
 
 export class TeraBoxAuthError extends Error {
   constructor(
-    message = "TeraBox butuh cookie akun untuk link ini. Set secret TERABOX_COOKIE di Worker (lihat README).",
+    message = "TeraBox butuh cookie akun untuk link ini. Set secret TERABOX_COOKIE (lihat README).",
   ) {
     super(message);
     this.name = "TeraBoxAuthError";
