@@ -5,6 +5,9 @@ import { resolveStream, type StreamPayload } from "./resolve";
 import { detectPlatform, extractMedia } from "./extract";
 import { browseTeraBox, normalizeShare } from "./extract/terabox";
 import { signedMediaUrl, deliverMedia } from "./sender";
+import { runCron } from "./cron";
+import { servePaste } from "./features/tools";
+import { checkAlerts, checkFeeds, checkMonitors, handleGithubWebhook } from "./features/monitor";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -24,6 +27,16 @@ export default {
 
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response("bot-tele is running", { headers: { "Content-Type": "text/plain" } });
+    }
+
+    if (url.pathname.startsWith("/p/")) {
+      return servePaste(env, url.pathname.slice(3));
+    }
+
+    if (url.pathname.startsWith("/gh/")) {
+      if (url.pathname.slice(4) !== env.WEBHOOK_SECRET) return new Response("Forbidden", { status: 403 });
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      return handleGithubWebhook(env, request);
     }
 
     if (url.pathname.startsWith("/tg/")) {
@@ -164,6 +177,43 @@ export default {
       }
     }
 
+    if (url.pathname === "/_cron") {
+      if (url.searchParams.get("key") !== env.WEBHOOK_SECRET) return new Response("Forbidden", { status: 403 });
+      const job = url.searchParams.get("job") ?? "all";
+      try {
+        if (job === "feeds") await checkFeeds(env);
+        else if (job === "monitors") await checkMonitors(env);
+        else if (job === "alerts") await checkAlerts(env);
+        else await runCron(env);
+        return json({ ok: true, job });
+      } catch (err) {
+        return json({ ok: false, job, error: err instanceof Error ? err.message : String(err) }, 500);
+      }
+    }
+
+    if (url.pathname === "/_ai") {
+      if (url.searchParams.get("key") !== env.WEBHOOK_SECRET) return new Response("Forbidden", { status: 403 });
+      const model = url.searchParams.get("model") ?? "@cf/meta/llama-3.1-8b-instruct";
+      const prompt = url.searchParams.get("prompt") ?? "halo";
+      try {
+        let inputs: unknown;
+        if (model.includes("flux")) inputs = { prompt };
+        else if (model.includes("melotts")) inputs = { prompt, lang: "en" };
+        else if (model.includes("whisper")) inputs = { audio: [] };
+        else inputs = { messages: [{ role: "user", content: prompt }], max_tokens: 200 };
+
+        const out: any = await (env.AI as any).run(model, inputs);
+        const summary: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(out ?? {})) {
+          if (typeof value === "string") summary[key] = { length: value.length, preview: value.slice(0, 120) };
+          else summary[key] = value;
+        }
+        return json({ ok: true, model, summary });
+      } catch (err) {
+        return json({ ok: false, model, error: err instanceof Error ? err.message : String(err) }, 500);
+      }
+    }
+
     if (url.pathname === "/_debug") {
       if (url.searchParams.get("key") !== env.WEBHOOK_SECRET) return new Response("Forbidden", { status: 403 });
       const target = url.searchParams.get("url") ?? "";
@@ -211,5 +261,9 @@ export default {
     }
 
     return new Response("Not found", { status: 404 });
+  },
+
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runCron(env));
   },
 };

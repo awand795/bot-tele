@@ -279,3 +279,124 @@ export async function sendMediaGroup(
   }));
   return tg(env, "sendMediaGroup", { chat_id: chatId, media });
 }
+
+/** Re-send a file that already lives on Telegram, using its file_id. */
+export async function sendByFileId(
+  env: Env,
+  chatId: number | string,
+  kind: "video" | "audio" | "photo" | "document" | "voice",
+  fileId: string,
+  caption?: string,
+): Promise<any> {
+  const method =
+    kind === "video"
+      ? "sendVideo"
+      : kind === "audio"
+        ? "sendAudio"
+        : kind === "photo"
+          ? "sendPhoto"
+          : kind === "voice"
+            ? "sendVoice"
+            : "sendDocument";
+  const payload: Record<string, unknown> = { chat_id: chatId, [kind]: fileId };
+  if (caption) {
+    payload.caption = clip(caption, 1000);
+    payload.parse_mode = "HTML";
+  }
+  return tg(env, method, payload);
+}
+
+export async function answerInlineQuery(
+  env: Env,
+  id: string,
+  results: unknown[],
+  opts: { cache_time?: number; is_personal?: boolean } = {},
+): Promise<any> {
+  return tg(env, "answerInlineQuery", {
+    inline_query_id: id,
+    results,
+    cache_time: opts.cache_time ?? 30,
+    is_personal: opts.is_personal ?? true,
+  });
+}
+
+export async function getFileBytes(env: Env, fileId: string): Promise<{ bytes: Uint8Array; path: string }> {
+  const file = await tg<{ file_path?: string }>(env, "getFile", { file_id: fileId });
+  if (!file.file_path) throw new Error("File Telegram tidak ditemukan.");
+  const res = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${file.file_path}`);
+  if (!res.ok) throw new Error(`Gagal mengunduh file dari Telegram (${res.status}).`);
+  return { bytes: new Uint8Array(await res.arrayBuffer()), path: file.file_path };
+}
+
+export async function sendBytes(
+  env: Env,
+  method: "sendPhoto" | "sendAudio" | "sendDocument" | "sendVoice",
+  field: "photo" | "audio" | "document" | "voice",
+  chatId: number | string,
+  bytes: Uint8Array,
+  filename: string,
+  mime: string,
+  extra: Record<string, string> = {},
+): Promise<any> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  for (const [k, v] of Object.entries(extra)) {
+    if (v) form.append(k, v);
+  }
+  form.append(field, new Blob([bytes], { type: mime }), filename);
+
+  const res = await fetch(apiUrl(env, method), { method: "POST", body: form });
+  const data: any = await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
+  if (!data.ok) throw new TgError(method, data.description ?? "unknown", data.error_code);
+  return data.result;
+}
+
+export function sendPhotoBytes(
+  env: Env,
+  chatId: number | string,
+  bytes: Uint8Array,
+  caption?: string,
+  mime = "image/jpeg",
+  filename = "image.jpg",
+): Promise<any> {
+  return sendBytes(env, "sendPhoto", "photo", chatId, bytes, filename, mime, {
+    ...(caption ? { caption: clip(caption, 1000), parse_mode: "HTML" } : {}),
+  });
+}
+
+export function sendAudioBytes(
+  env: Env,
+  chatId: number | string,
+  bytes: Uint8Array,
+  filename = "audio.mp3",
+  mime = "audio/mpeg",
+  extra: Record<string, string> = {},
+): Promise<any> {
+  return sendBytes(env, "sendAudio", "audio", chatId, bytes, filename, mime, extra);
+}
+
+export function sendDocumentBytes(
+  env: Env,
+  chatId: number | string,
+  bytes: Uint8Array,
+  filename = "file.bin",
+  mime = "application/octet-stream",
+  extra: Record<string, string> = {},
+): Promise<any> {
+  return sendBytes(env, "sendDocument", "document", chatId, bytes, filename, mime, extra);
+}
+
+export function splitText(text: string, max = 3800): string[] {
+  const chunks: string[] = [];
+  let rest = text.trim();
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf("\n", max);
+    if (cut < max * 0.5) cut = rest.lastIndexOf(" ", max);
+    if (cut < max * 0.5) cut = max;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.length ? chunks : [""];
+}
+

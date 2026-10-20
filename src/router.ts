@@ -12,21 +12,46 @@ import {
 } from "./telegram";
 import {
   backMenu,
+  downloadMenu,
   HELP_TEXT,
   mainMenu,
+  aiMenu,
+  monitorMenu,
   rateLimited,
+  settingMenu,
   SOSMED_PROMPT,
   START_TEXT,
   STORY_TEXT,
   TERABOX_PROMPT,
+  toolsMenu,
+  TOOLS_TEXT,
+  vaultMenu,
+  VAULT_TEXT,
+  AI_TEXT,
+  MONITOR_TEXT,
+  SETTING_TEXT,
   YOUTUBE_PROMPT,
 } from "./menus";
 import { clearState, getState, loadGroup, saveGroup, setState, type Action, type UserState } from "./state";
 import { checkRate } from "./ratelimit";
-import { detectPlatform, extractMedia } from "./extract";
+import { detectPlatform } from "./extract";
 import { browseTeraBox, getTeraBoxDownload, normalizeShare, type TbBrowse } from "./extract/terabox";
 import { deliverMedia, signedMediaUrl } from "./sender";
-import { humanDuration, humanSize, type Media } from "./extract/types";
+import { humanSize, type Media } from "./extract/types";
+import { showExtract } from "./preview";
+import { getOwner, isAllowed, touchUser, type UserRow } from "./users";
+import { bump } from "./stats";
+import { isOwner } from "./features/admin";
+import {
+  dispatchAction,
+  dispatchCallback,
+  dispatchCommand,
+  dispatchFlow,
+  dispatchMedia,
+  handleInline,
+  notifyOwnerNewUser,
+  type Ctx,
+} from "./features";
 
 const MAX_TEXT = 3800;
 
@@ -50,6 +75,18 @@ function promptFor(flow: UserState["flow"]): string {
   }
 }
 
+function makeCtx(
+  env: Env,
+  origin: string,
+  msg: TgMessage,
+  userId: number,
+  text: string,
+): Ctx {
+  const parts = text.trim().split(/\s+/).filter(Boolean);
+  const args = text.startsWith("/") ? parts.slice(1) : parts;
+  return { env, origin, chatId: msg.chat.id, userId, msg, text, args };
+}
+
 export async function handleUpdate(env: Env, update: TgUpdate, origin: string): Promise<void> {
   if (update.message) {
     await handleMessage(env, update.message, origin);
@@ -57,23 +94,65 @@ export async function handleUpdate(env: Env, update: TgUpdate, origin: string): 
   }
   if (update.callback_query) {
     await handleCallback(env, update.callback_query, origin);
+    return;
+  }
+  if (update.inline_query) {
+    try {
+      await handleInline(env, origin, update.inline_query);
+    } catch (err) {
+      console.warn("inline failed", (err as Error).message);
+    }
   }
 }
 
 async function handleMessage(env: Env, msg: TgMessage, origin: string): Promise<void> {
   const chatId = msg.chat.id;
-  const userId = msg.from?.id ?? chatId;
+  if (!msg.from) return;
+  const userId = msg.from.id;
+
+  let user: UserRow;
+  try {
+    user = await touchUser(env, msg.from);
+  } catch (err) {
+    console.error("touchUser failed", err);
+    await sendMessage(env, chatId, "❌ Database sedang tidak bisa diakses. Coba lagi sebentar.").catch(() => undefined);
+    return;
+  }
+
+  if (!(await isAllowed(env, user))) {
+    if (user.role === "pending" && Date.now() - user.created_at < 60_000) {
+      await notifyOwnerNewUser(env, user.id, [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" "));
+    }
+    await sendMessage(
+      env,
+      chatId,
+      "⛔ <b>Bot ini privat</b>\n\n" +
+        `ID kamu: <code>${userId}</code>\n\n` +
+        "Minta owner menambahkan ID ini lewat <code>/allow " +
+        userId +
+        "</code>.",
+    ).catch(() => undefined);
+    return;
+  }
+
   const text = (msg.text ?? "").trim();
+
+  // Any file/photo/video/voice is stored in the vault.
+  if (msg.document || msg.video || msg.audio || msg.photo || msg.voice) {
+    await dispatchMedia(makeCtx(env, origin, msg, userId, text || msg.caption || ""));
+    return;
+  }
+
   if (!text) return;
 
   if (text.startsWith("/")) {
-    if (msg.from && text.toLowerCase().startsWith("/start")) {
+    if (text.toLowerCase().startsWith("/start")) {
       try {
         await env.BOT_KV.put(
-          `chat:${msg.from.id}`,
+          `chat:${userId}`,
           JSON.stringify({
             id: chatId,
-            userId: msg.from.id,
+            userId,
             name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" "),
             username: msg.from.username,
             at: Date.now(),
@@ -84,19 +163,33 @@ async function handleMessage(env: Env, msg: TgMessage, origin: string): Promise<
         /* non fatal */
       }
     }
+
+    const ctx = makeCtx(env, origin, msg, userId, text);
+    if (await dispatchCommand(ctx, text)) return;
     await handleCommand(env, chatId, userId, text);
     return;
   }
 
+  const state = await getState(env, userId);
   const url = extractFirstUrl(text);
+  const urlFlows: UserState["flow"][] = ["rss", "monitor", "ringkas"];
+
+  if (state && state.flow !== "idle" && url && urlFlows.includes(state.flow)) {
+    await dispatchFlow(makeCtx(env, origin, msg, userId, text), state.flow);
+    return;
+  }
+
   if (url) {
     await handleUrl(env, origin, chatId, userId, url);
     return;
   }
 
-  const state = await getState(env, userId);
   if (state && state.flow !== "idle") {
-    await sendMessage(env, chatId, promptFor(state.flow), { keyboard: backMenu() });
+    if (["terabox", "sosmed", "youtube", "story"].includes(state.flow)) {
+      await sendMessage(env, chatId, promptFor(state.flow), { keyboard: backMenu() });
+      return;
+    }
+    await dispatchFlow(makeCtx(env, origin, msg, userId, text), state.flow);
     return;
   }
 
@@ -110,15 +203,26 @@ async function handleCommand(env: Env, chatId: number, userId: number, text: str
       await clearState(env, userId);
       await sendMessage(env, chatId, START_TEXT, { keyboard: mainMenu() });
       return;
+    case "/menu":
+      await clearState(env, userId);
+      await sendMessage(env, chatId, START_TEXT, { keyboard: mainMenu() });
+      return;
     case "/help":
       await sendMessage(env, chatId, HELP_TEXT, { keyboard: backMenu() });
       return;
     case "/id":
-      await sendMessage(env, chatId, `Chat ID: <code>${chatId}</code>\nUser ID: <code>${userId}</code>`);
+      await sendMessage(
+        env,
+        chatId,
+        `Chat ID: <code>${chatId}</code>\nUser ID: <code>${userId}</code>`,
+      );
       return;
     case "/cancel":
       await clearState(env, userId);
       await sendMessage(env, chatId, "Dibatalkan. Pilih menu untuk mulai lagi.", { keyboard: mainMenu() });
+      return;
+    case "/ping":
+      await sendMessage(env, chatId, "🏓 Pong!");
       return;
     default:
       await sendMessage(env, chatId, "Command tidak dikenal. Lihat /help.", { keyboard: backMenu() });
@@ -155,66 +259,11 @@ async function handleUrl(env: Env, origin: string, chatId: number, userId: numbe
     } else {
       await showExtract(env, origin, chatId, status.message_id, rawUrl);
     }
+    await bump(env, `dl:${platform}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Terjadi kesalahan";
     await editMessage(env, chatId, status.message_id, `❌ ${esc(message)}`, { keyboard: backMenu() });
   }
-}
-
-async function showExtract(env: Env, origin: string, chatId: number, messageId: number, url: string): Promise<void> {
-  const result = await extractMedia(env, url);
-  if (!result.medias.length) throw new Error("Tidak ada media yang bisa diambil dari link itu.");
-
-  const actions: Action[] = [];
-  const specs: Array<Array<{ text: string; idx: number }>> = [];
-
-  const push = (action: Action, label: string) => {
-    actions.push(action);
-    return { text: label, idx: actions.length - 1 };
-  };
-
-  if (result.medias.length > 1) {
-    const album = push({ k: "album", medias: result.medias, caption: result.caption }, `📥 Semua (${result.medias.length})`);
-    specs.push([album]);
-  } else {
-    const media = result.medias[0];
-    const label =
-      media.kind === "video"
-        ? `🎬 Video${media.size ? ` (${humanSize(media.size)})` : ""}`
-        : media.kind === "audio"
-          ? "🎵 Audio"
-          : media.kind === "photo"
-            ? "🖼 Foto"
-            : "📄 File";
-    specs.push([push({ k: "media", media, caption: result.caption }, label)]);
-  }
-
-  const extraButtons = result.extras.map((extra) =>
-    push(
-      { k: "media", media: extra, caption: `<b>${esc(extra.title ?? "Audio")}</b>` },
-      extra.kind === "audio" ? "🎵 Audio M4A" : "📄 File",
-    ),
-  );
-  if (extraButtons.length) specs.push(extraButtons);
-
-  specs.push([push({ k: "media", media: result.medias[0], caption: result.caption }, "📥 Download Ulang")]);
-
-  const gid = await saveGroup(env, actions);
-  const keyboard: InlineKeyboardMarkup = {
-    inline_keyboard: specs.map((row) =>
-      row.map((b) => ({ text: b.text, callback_data: `a:${gid}:${b.idx}` })),
-    ),
-  };
-  keyboard.inline_keyboard.push([{ text: "⬅️ Menu Utama", callback_data: "menu:home" }]);
-
-  const first = result.medias[0];
-  const meta: string[] = [];
-  if (first.size) meta.push(`📦 ${humanSize(first.size)}`);
-  if (first.duration) meta.push(`⏱ ${humanDuration(first.duration)}`);
-  if (result.medias.length > 1) meta.push(`🖼 ${result.medias.length} media`);
-
-  const text = clip(`${result.caption}\n\n${meta.join(" · ")}`, MAX_TEXT);
-  await editMessage(env, chatId, messageId, text, { keyboard });
 }
 
 interface ButtonSpec {
@@ -268,12 +317,11 @@ async function renderTeraBox(
   if (summary.length) lines.push(summary.join(" · "));
   lines.push("");
 
-  browse.dirs.forEach((dir, i) => {
+  browse.dirs.forEach((dir) => {
     const path = dir.path || `/${dir.server_filename}`;
     actions.push({ k: "tb_page", share, dir: path, page: 1 });
     rows.push([{ text: `📁 ${clip(dir.server_filename, 40)}`, idx: actions.length - 1 }]);
     lines.push(`📁 ${esc(dir.server_filename)}`);
-    void i;
   });
 
   browse.files.forEach((file, i) => {
@@ -329,8 +377,20 @@ async function handleCallback(env: Env, cb: TgCallbackQuery, origin: string): Pr
     return;
   }
 
+  let user: UserRow;
+  try {
+    user = await touchUser(env, cb.from);
+  } catch {
+    await answerCallback(env, cb.id, "Database error.");
+    return;
+  }
+  if (!(await isAllowed(env, user))) {
+    await answerCallback(env, cb.id, "Akses ditolak.");
+    return;
+  }
+
   if (data.startsWith("menu:")) {
-    await handleMenu(env, cb, chatId, messageId, data.slice(5));
+    await handleMenu(env, origin, cb, chatId, messageId, data.slice(5));
     return;
   }
 
@@ -340,11 +400,20 @@ async function handleCallback(env: Env, cb: TgCallbackQuery, origin: string): Pr
   }
 
   await answerCallback(env, cb.id);
+  await dispatchCallback(env, origin, cb, data);
 }
 
-async function handleMenu(env: Env, cb: TgCallbackQuery, chatId: number, messageId: number, key: string): Promise<void> {
+async function handleMenu(
+  env: Env,
+  origin: string,
+  cb: TgCallbackQuery,
+  chatId: number,
+  messageId: number,
+  key: string,
+): Promise<void> {
   const userId = cb.from.id;
   await answerCallback(env, cb.id);
+  const ctx = makeCtx(env, origin, cb.message!, userId, "");
 
   switch (key) {
     case "home":
@@ -353,6 +422,9 @@ async function handleMenu(env: Env, cb: TgCallbackQuery, chatId: number, message
       return;
     case "help":
       await editMessage(env, chatId, messageId, HELP_TEXT, { keyboard: backMenu() });
+      return;
+    case "download":
+      await editMessage(env, chatId, messageId, "<b>⬇️ Download</b>\n\nPilih sumber:", { keyboard: downloadMenu() });
       return;
     case "terabox":
       await setState(env, userId, "terabox");
@@ -369,9 +441,94 @@ async function handleMenu(env: Env, cb: TgCallbackQuery, chatId: number, message
     case "story":
       await editMessage(env, chatId, messageId, STORY_TEXT, { keyboard: backMenu() });
       return;
+    case "tools":
+      await editMessage(env, chatId, messageId, TOOLS_TEXT, { keyboard: toolsMenu() });
+      return;
+    case "vault":
+      await editMessage(env, chatId, messageId, VAULT_TEXT, { keyboard: vaultMenu() });
+      return;
+    case "vault_files":
+      await dispatchCommand(ctx, "/vault");
+      return;
+    case "notes":
+      await dispatchCommand(ctx, "/notes");
+      return;
+    case "todos":
+      await dispatchCommand(ctx, "/todos");
+      return;
+    case "reminders":
+      await dispatchCommand(ctx, "/reminders");
+      return;
+    case "ai":
+      await editMessage(env, chatId, messageId, AI_TEXT, { keyboard: aiMenu() });
+      return;
+    case "stt_info":
+      await editMessage(
+        env,
+        chatId,
+        messageId,
+        "📝 <b>Transkripsi</b>\n\nReply voice note atau file audio dengan <code>/stt</code>.",
+        { keyboard: backMenu() },
+      );
+      return;
+    case "monitor":
+      await editMessage(env, chatId, messageId, MONITOR_TEXT, { keyboard: monitorMenu() });
+      return;
+    case "rss":
+      await dispatchCommand(ctx, "/rss");
+      return;
+    case "uptime":
+      await dispatchCommand(ctx, "/monitor");
+      return;
+    case "alert":
+      await dispatchCommand(ctx, "/alert");
+      return;
+    case "github":
+      await editMessage(
+        env,
+        chatId,
+        messageId,
+        "🐙 <b>GitHub</b>\n\nOwner bisa mengaktifkan notifikasi dengan:\n<code>/gh owner/repo</code>\n\n" +
+          "Setelah itu salin Webhook URL dari bot ke pengaturan repo GitHub.",
+        { keyboard: monitorMenu() },
+      );
+      return;
+    case "setting":
+      await editMessage(env, chatId, messageId, SETTING_TEXT, {
+        keyboard: settingMenu(await isOwner(env, userId)),
+      });
+      return;
+    case "status":
+      await dispatchCommand(ctx, "/status");
+      return;
+    case "profile": {
+      const owner = await getOwner(env);
+      await editMessage(
+        env,
+        chatId,
+        messageId,
+        `🆔 <b>Profil</b>\n\nUser ID: <code>${userId}</code>\nChat ID: <code>${chatId}</code>\n` +
+          `Role: <b>${userRoleLabel(userId, owner?.id)}</b>`,
+        { keyboard: backMenu() },
+      );
+      return;
+    }
+    case "stats":
+      await dispatchCommand(ctx, "/stats");
+      return;
+    case "users":
+      await dispatchCommand(ctx, "/users");
+      return;
+    case "backup":
+      await dispatchCommand(ctx, "/backup");
+      return;
     default:
       await editMessage(env, chatId, messageId, START_TEXT, { keyboard: mainMenu() });
   }
+}
+
+function userRoleLabel(userId: number, ownerId?: number): string {
+  return userId === ownerId ? "owner" : "member";
 }
 
 async function handleAction(
@@ -395,6 +552,8 @@ async function handleAction(
   await answerCallback(env, cb.id);
 
   try {
+    if (await dispatchAction(env, origin, chatId, messageId, cb.from.id, action)) return;
+
     switch (action.k) {
       case "tb_dl":
         await teraBoxLink(env, chatId, action.share, action.fsId);
@@ -410,6 +569,7 @@ async function handleAction(
       }
       case "media": {
         const result = await deliverMedia(env, origin, chatId, action.media, action.caption);
+        await bump(env, `deliver:${result.mode}`);
         await markDone(env, chatId, messageId, result.mode);
         return;
       }
@@ -456,9 +616,7 @@ async function teraBoxLink(env: Env, chatId: number, share: string, fsId: string
     const dl = await getTeraBoxDownload(env, share, fsId);
     const hours = Math.max(1, Math.round((dl.expires_in_s || 3600) / 3600));
     const text =
-      `📄 <b>${esc(dl.filename)}</b>\n` +
-      `📦 ${dl.size_h || humanSize(dl.size)}\n\n` +
-      `Link berlaku ±${hours} jam.`;
+      `📄 <b>${esc(dl.filename)}</b>\n` + `📦 ${dl.size_h || humanSize(dl.size)}\n\n` + `Link berlaku ±${hours} jam.`;
     await editMessage(env, chatId, wait.message_id, text, {
       keyboard: {
         inline_keyboard: [

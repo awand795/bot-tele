@@ -11,5 +11,18 @@
       "binding": "BOT_KV",
       "id": "dc4b5081245840fbb0982c8af8f8aae9"
     }
-  ]
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bot-tele-db",
+      "database_id": "57bfbeec-4185-4fb3-8eb5-fe6074bd3443"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
 }

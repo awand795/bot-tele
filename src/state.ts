@@ -6,10 +6,46 @@ export type Action =
   | { k: "tb_send"; share: string; fsId: string; name: string; size?: number }
   | { k: "tb_page"; share: string; dir: string; page: number }
   | { k: "media"; media: Media; caption?: string }
-  | { k: "album"; medias: Media[]; caption?: string };
+  | { k: "album"; medias: Media[]; caption?: string }
+  | { k: "yt_item"; videoId: string }
+  | { k: "vault_send"; id: number }
+  | { k: "vault_del"; id: number }
+  | { k: "note_del"; id: number }
+  | { k: "todo_done"; id: number }
+  | { k: "todo_del"; id: number }
+  | { k: "rem_del"; id: number }
+  | { k: "rss_del"; id: number }
+  | { k: "mon_del"; id: number }
+  | { k: "alert_del"; id: number }
+  | { k: "stt"; fileId: string; name?: string };
+
+export type Flow =
+  | "idle"
+  | "terabox"
+  | "sosmed"
+  | "youtube"
+  | "story"
+  | "qr"
+  | "weather"
+  | "prayer"
+  | "currency"
+  | "lyrics"
+  | "ai"
+  | "cari"
+  | "paste"
+  | "note"
+  | "todo"
+  | "remind"
+  | "rss"
+  | "monitor"
+  | "alert"
+  | "ringkas"
+  | "tr"
+  | "img"
+  | "tts";
 
 export interface UserState {
-  flow: "terabox" | "sosmed" | "youtube" | "story" | "idle";
+  flow: Flow;
   at: number;
 }
 

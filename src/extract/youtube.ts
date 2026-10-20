@@ -216,6 +216,59 @@ export async function resolveYtStream(env: Env, id: string, itag: number): Promi
   throw new Error("Stream YouTube tidak tersedia lagi, coba ulang.");
 }
 
+export interface YtSearchItem {
+  id: string;
+  title: string;
+  author: string;
+  duration?: number;
+  views?: string;
+  thumb?: string;
+}
+
+function parseClock(text?: string): number | undefined {
+  if (!text) return undefined;
+  const parts = text.split(":").map((p) => Number(p));
+  if (parts.some((n) => !Number.isFinite(n))) return undefined;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+/** Search YouTube through the same Innertube client used for playback. */
+export async function searchYouTube(limit: number, query: string): Promise<YtSearchItem[]> {
+  const res = await fetch(`https://www.youtube.com/youtubei/v1/search?key=${INNERTUBE_KEY}&prettyPrint=false`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": VR_UA,
+      "X-YouTube-Client-Name": "28",
+      "X-YouTube-Client-Version": "1.60.19",
+    },
+    body: JSON.stringify({ query, context: { client: CLIENT } }),
+  });
+  if (!res.ok) throw new Error(`YouTube search gagal (${res.status})`);
+
+  const json: any = await res.json();
+  const sections = json?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents ?? [];
+  const items: YtSearchItem[] = [];
+
+  for (const section of sections) {
+    const contents = section?.itemSectionRenderer?.contents ?? [];
+    for (const entry of contents) {
+      const video = entry?.videoRenderer;
+      if (!video?.videoId) continue;
+      items.push({
+        id: video.videoId,
+        title: video.title?.runs?.map((r: any) => r.text).join("") ?? video.title?.simpleText ?? "Video",
+        author: video.ownerText?.runs?.[0]?.text ?? "",
+        duration: parseClock(video.lengthText?.simpleText),
+        views: video.viewCountText?.simpleText ?? video.shortViewCountText?.simpleText ?? "",
+        thumb: video.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ?? `https://i.ytimg.com/vi/${video.videoId}/hqdefault.jpg`,
+      });
+      if (items.length >= limit) return items;
+    }
+  }
+  return items;
+}
+
 export function safeName(name: string): string {
   return (name || "youtube")
     .replace(/[\\/:*?"<>|\r\n]+/g, " ")

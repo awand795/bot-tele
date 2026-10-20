@@ -1,6 +1,7 @@
 # bot-tele
 
-Bot downloader Telegram yang berjalan **100% di Cloudflare Workers** — tanpa VPS, tanpa server sendiri.
+Asisten pribadi Telegram yang berjalan **100% di Cloudflare Workers** — tanpa VPS, tanpa server sendiri.
+Dimulai sebagai downloader, sekarang juga punya tools, vault file, AI, monitor, dan admin.
 
 - **Bot:** https://t.me/adnawaa_bot
 - **Worker:** https://bot-tele.awand795.workers.dev
@@ -8,7 +9,11 @@ Bot downloader Telegram yang berjalan **100% di Cloudflare Workers** — tanpa V
 
 ---
 
-## Status fitur
+## Fitur
+
+Menu utama: **Download · Tools · Vault · AI · Monitor · Setting**
+
+### ⬇️ Download
 
 | Platform | Yang didukung | Status | Catatan |
 | --- | --- | --- | --- |
@@ -16,96 +21,92 @@ Bot downloader Telegram yang berjalan **100% di Cloudflare Workers** — tanpa V
 | **TikTok** | Video HD, slideshow foto, audio | ✅ stabil | tikwm + fallback scrape halaman |
 | **Facebook** | Video / Reel publik | ✅ stabil | Plugin embed + regex halaman |
 | **Instagram** | Post / Reel / carousel | ⚠️ best-effort | Sering `429` dari IP Cloudflare |
-| **TeraBox** | Browse folder + download | ⏸️ pending | Butuh cookie akun (lihat bagian TeraBox) |
-| **Story** | — | 🚧 segera hadir | Placeholder menu |
+| **TeraBox** | Browse folder + download | ⏸️ pending | Butuh cookie akun, lihat bagian TeraBox |
+| **Story** | — | 🚧 placeholder | Butuh sesi login |
 
-### Batas pengiriman file
+Batas pengiriman file:
 
-| Ukuran file | Perlakuan |
+| Ukuran | Perlakuan |
 | --- | --- |
 | ≤ 20 MB | Telegram mengambil sendiri dari signed URL `/dl/...` |
 | 20–45 MB | Bot upload streaming ke Bot API |
 | > 45 MB | Dikirim sebagai link download |
 
-- Rate limit: **12 request/jam/user**.
-- Update Telegram di-dedupe (`upd:<update_id>`, TTL 5 menit) supaya tidak diproses dua kali saat retry.
+- Rate limit download: **12 request/jam/user**.
+- Update Telegram di-dedupe (`upd:<update_id>`, TTL 5 menit).
 
----
+### 🧰 Tools
 
-## Cara pakai bot
+| Command | Fungsi | Sumber |
+| --- | --- | --- |
+| `/qr <teks>` | QR code | api.qrserver.com |
+| `/cuaca <kota>` | Cuaca sekarang + 3 hari | Open-Meteo |
+| `/sholat <kota>` | Jadwal sholat hari ini | Aladhan (Kemenag) |
+| `/kurs USD` / `/kurs 100 USD IDR` | Kurs mata uang | open.er-api.com |
+| `/lirik <judul>` | Lirik lagu | lyrics.ovh |
+| `/paste <teks>` | Paste publik 30 hari (`/p/<slug>`) | D1 |
+| `/get <slug>` | Ambil isi paste | D1 |
+| `/cari <judul>` | Cari video YouTube, langsung bisa download | Innertube |
 
-1. Buka bot → tekan **/start**.
-2. Pilih menu **TeraBox / Sosmed / YouTube**, atau langsung kirim link.
-3. Klik tombol download yang muncul.
+### 🗂 Vault & produktivitas
 
-Command yang tersedia:
+- Kirim **dokumen / video / audio / foto / voice** ke bot → otomatis tersimpan di vault.
+- File aslinya **tetap di server Telegram**; bot hanya menyimpan `file_id` + metadata di D1.
+- `/vault` → daftar file, tombol kirim ulang / hapus.
+- `/note`, `/notes`, `/todo`, `/todos`, `/done`, `/remind`, `/reminders`.
 
-| Command | Fungsi |
+Format pengingat (WIB):
+
+```
+/remind 07:30 sarapan
+/remind 2026-10-21 09:00 meeting
+```
+
+### 🤖 AI (Cloudflare Workers AI)
+
+| Command | Model |
 | --- | --- |
-| `/start` | Menu utama |
-| `/help` | Bantuan |
-| `/id` | Lihat chat ID & user ID |
-| `/cancel` | Batalkan input |
+| `/ai <pertanyaan>` | Llama 3.3 70B (fallback Llama 3.1 8B / 3.2 3B) |
+| `/ringkas <url\|teks>` | Llama 3.3 70B |
+| `/tr en <teks>` | Llama 3.3 70B |
+| `/img <prompt>` | FLUX.1 schnell |
+| `/tts <teks>` | MeloTTS (dikirim sebagai file WAV) |
+| `/stt` (reply voice) | Whisper |
 
----
+- Kuota **20 request/hari/user** (`ai_usage` di D1).
+- Chat menyimpan konteks 5 pesan terakhir di KV (TTL 1 jam).
+- Tidak perlu API key eksternal — cukup binding `AI`.
 
-## Kendala yang diketahui (selain TeraBox)
+### 📡 Monitor
 
-### 1. Instagram sering `429 Too Many Requests`
+| Command | Fungsi | Interval cek |
+| --- | --- | --- |
+| `/rss add <url>` | Notifikasi item RSS/Atom baru (maks 5/user) | ±10 menit |
+| `/monitor add <url>` | Notifikasi website up/down (maks 5/user) | ±5 menit |
+| `/alert BTC > 100000` | Alert harga crypto USD (maks 10/user) | ±15 menit |
+| `/gh owner/repo` | Notifikasi GitHub (push, issue, PR, release, workflow) | realtime webhook |
 
-**Penyebab:** Instagram membatasi IP datacenter, sedangkan Worker Cloudflare memakai IP egress bersama.
+- `/rss`, `/monitor`, `/alert` tanpa argumen → daftar + tombol hapus.
+- Harga: CoinGecko, fallback Binance jika kena rate limit.
+- GitHub webhook: `POST /gh/<WEBHOOK_SECRET>`, signatura `X-Hub-Signature-256` diverifikasi.
 
-**Yang sudah dicoba:**
+### ⚙️ Setting & admin
 
-- `www.instagram.com/api/v1/media/{code}/info/` + header `x-ig-app-id` → `429`
-- `i.instagram.com/api/v1/media/{code}/info/` (UA aplikasi) → `403 login_required`
-- `/{code}/embed/captioned/` → `200`, tetapi hanya berhasil untuk post yang masih hidup
+| Command | Akses | Fungsi |
+| --- | --- | --- |
+| `/id` | semua | Chat ID & user ID |
+| `/status` | semua | Status D1, KV, AI, webhook, GitHub |
+| `/backup` | semua | Backup data user ke JSON |
+| `/allow <id>` | owner | Izinkan user |
+| `/deny <id>` | owner | Blokir user |
+| `/users` | owner | Daftar user |
+| `/stats` | owner | Statistik hari ini |
+| `/audit` | owner | Audit log terakhir |
+| `/gh owner/repo` | owner | Aktifkan notifikasi GitHub |
 
-**Rencana lanjutan:**
-
-- Tambah fallback endpoint `graphql/query` dengan `doc_id`.
-- Coba varian embed `?__a=1&__d=dis`.
-- Jika tetap gagal, tampilkan pesan yang lebih jelas dan sarankan link TikTok/Facebook.
-
-### 2. TikTok `Free Api Limit: 1 request/second`
-
-**Penyebab:** tikwm membatasi 1 request/detik per IP, dan IP Worker dipakai bersama.
-
-**Solusi yang sudah jalan:** fallback scrape halaman TikTok melalui
-`__UNIVERSAL_DATA_FOR_REHYDRATION__`, sehingga video/foto/audio tetap bisa diambil.
-
-**Rencana lanjutan:** cache hasil per URL selama 5–10 menit untuk mengurangi request.
-
-### 3. YouTube hanya tersedia 360p
-
-**Penyebab:** free plan tidak memungkinkan remux/ffmpeg. Format muxed yang tersedia tanpa remux adalah **itag 18 (360p)**.
-
-**Yang dipakai:** Innertube client `ANDROID_VR` v1.60.19:
-
-- `itag 18` → video 360p (gambar + suara)
-- `itag 140` → audio M4A
-
-**Catatan:** HLS (`itag 230/231/232`) sebenarnya muxed, tetapi berformat MPEG-TS sehingga butuh remux — di luar scope free plan.
-
-**Rencana lanjutan:** jika upgrade ke Workers Paid, tambahkan remux (ffmpeg.wasm / container) untuk 720p+.
-
-### 4. Batas Cloudflare Workers Free
-
-- **CPU 10 ms/request** → tidak ada remux/transcode.
-- **KV 1.000 write/hari** → dipakai untuk state, cache, rate limit, dan dedupe.
-- **Tanpa Durable Objects** di free plan.
-
-**Rencana lanjutan:** kurangi jumlah write dengan menggabungkan state + rate limit dalam satu key.
-
-### 5. Batas Telegram
-
-- URL fetch maksimal **20 MB**, multipart maksimal **50 MB** → bot memakai threshold **45 MB**.
-- Upload streaming memakai `Content-Length`; jika runtime menolak, otomatis fallback ke link.
-- Video > 45 MB selalu dikirim sebagai link.
-
-### 6. Webhook dan retry
-
-Telegram mengirim ulang update jika respons lambat. Bot menyimpan `upd:<update_id>` di KV (TTL 5 menit) untuk mencegah proses ganda.
+- User pertama yang `/start` menjadi **owner**.
+- User lain masuk status **pending** sampai di-`/allow`.
+- Owner otomatis mendapat notifikasi saat ada user baru.
 
 ---
 
@@ -113,19 +114,55 @@ Telegram mengirim ulang update jika respons lambat. Bot menyimpan `upd:<update_i
 
 ```
 Telegram ──POST /tg/<secret>──► router
-                                ├─ extract (YouTube / TikTok / IG / FB)
-                                ├─ signed link / upload / link
+                                ├─ downloader (YouTube/TikTok/IG/FB/TeraBox)
+                                ├─ tools / vault / AI / monitor / admin
+                                ├─ inline query
                                 └─ balas pesan + inline keyboard
 
 Telegram ──GET /dl/<token>──► verifikasi HMAC ──► resolve upstream ──► stream (Range)
+Browser  ──GET /p/<slug>──► halaman paste (HTML)
+GitHub   ──POST /gh/<secret>──► verifikasi HMAC ──► notifikasi ke chat
+Cron     ──* * * * *──► reminder · uptime · RSS · alert
 ```
 
-- **Signed URL** memakai HMAC-SHA256 (`WEBHOOK_SECRET`) dengan masa berlaku 2 jam.
-- Payload link menyimpan **instruksi**, bukan URL mentah:
-  - `yt` → resolve ulang Innertube saat file diunduh
-  - `tb` → resolve ulang TeraBox
-  - `u` → fetch URL langsung
-- Tujuannya agar link CDN yang kedaluwarsa tidak membuat download gagal.
+Binding:
+
+| Binding | Fungsi |
+| --- | --- |
+| `BOT_KV` | state flow, cache YouTube, rate limit, dedupe update, chat registry |
+| `DB` (D1) | user, vault index, notes, todos, reminders, pastes, feeds, monitors, alerts, AI usage, stats, audit, settings |
+| `AI` | Workers AI |
+| `secrets` | `BOT_TOKEN`, `WEBHOOK_SECRET`, `TERABOX_COOKIE` (opsional) |
+
+### Signed URL
+
+HMAC-SHA256 (`WEBHOOK_SECRET`), berlaku 2 jam. Payload menyimpan **instruksi**, bukan URL mentah:
+
+- `yt` → resolve ulang Innertube saat diunduh
+- `tb` → resolve ulang TeraBox
+- `u` → fetch URL langsung
+
+Tujuannya agar link CDN yang kedaluwarsa tidak membuat download gagal.
+
+### Tabel D1
+
+```sql
+users(id, username, first_name, role, created_at)
+vault(id, user_id, file_id, file_unique_id, kind, name, size, mime, caption, created_at)
+notes(id, user_id, text, created_at)
+todos(id, user_id, text, done, created_at)
+reminders(id, user_id, chat_id, text, due_at, sent, created_at)
+pastes(slug, user_id, text, created_at, expires_at)
+feeds(id, user_id, chat_id, url, title, last_seen, last_checked, created_at)
+monitors(id, user_id, chat_id, url, status, last_checked, created_at)
+alerts(id, user_id, chat_id, symbol, op, target, triggered, created_at)
+ai_usage(user_id, day, count)
+stats(day, feature, count)
+audit(id, user_id, action, meta, created_at)
+settings(key, value)
+```
+
+Skema lengkap: [`schema.sql`](schema.sql).
 
 ---
 
@@ -133,26 +170,43 @@ Telegram ──GET /dl/<token>──► verifikasi HMAC ──► resolve upstre
 
 ```
 src/
-  index.ts          # HTTP router: /tg, /dl, /health, debug
-  router.ts         # command, menu, callback, flow TeraBox
-  menus.ts          # teks & keyboard
-  telegram.ts       # wrapper Bot API + multipart streaming
-  sender.ts         # strategi kirim: URL → upload → link
-  resolve.ts        # payload → stream upstream
-  crypto.ts         # HMAC signed link
-  state.ts          # KV state, grup action, cache
-  ratelimit.ts      # 12 request/jam
+  index.ts              # HTTP router: /tg, /dl, /p, /gh, /health, debug
+  router.ts             # dispatch update, menu, callback, flow TeraBox
+  menus.ts              # teks & keyboard semua menu
+  telegram.ts           # wrapper Bot API, multipart streaming & bytes
+  sender.ts             # strategi kirim: URL → upload → link
+  resolve.ts            # payload → stream upstream
+  crypto.ts             # HMAC signed link
+  state.ts              # KV state, grup action, cache
+  ratelimit.ts          # 12 download/jam
+  db.ts                 # helper D1
+  users.ts              # user & whitelist
+  time.ts               # WIB & parser reminder
+  stats.ts              # stats + audit
+  cron.ts               # entry cron tiap menit
+  preview.ts            # preview media + tombol download
+  features/
+    index.ts            # registry command/flow/callback
+    tools.ts            # QR, cuaca, sholat, kurs, lirik, paste
+    vault.ts            # simpan & kirim ulang file
+    productivity.ts     # note, todo, reminder
+    ai.ts               # chat, ringkas, translate, image, TTS, STT
+    search.ts           # cari YouTube + inline mode
+    monitor.ts          # RSS, uptime, crypto, GitHub
+    admin.ts            # allow/deny/users/stats/audit/status/backup
   extract/
-    index.ts        # deteksi platform
-    youtube.ts      # Innertube ANDROID_VR
-    tiktok.ts       # tikwm + scrape fallback
-    instagram.ts    # web API → app API → embed
-    facebook.ts     # plugin → embed → page
-    terabox.ts      # direct API + cookie (pending)
+    index.ts            # deteksi platform
+    youtube.ts          # Innertube ANDROID_VR + search
+    tiktok.ts           # tikwm + scrape fallback
+    instagram.ts        # web API → app API → embed
+    facebook.ts         # plugin → embed → page
+    terabox.ts          # direct API + cookie (pending)
     types.ts
 scripts/
   set-webhook.mjs
   webhook-info.mjs
+schema.sql
+wrangler.jsonc
 ```
 
 ---
@@ -173,61 +227,98 @@ $env:CLOUDFLARE_ACCOUNT_ID="<ACCOUNT_ID>"
 npx wrangler kv namespace create BOT_KV
 ```
 
-Salin `id` yang muncul ke `wrangler.jsonc` pada bagian `kv_namespaces`.
+Salin `id` ke `wrangler.jsonc` bagian `kv_namespaces`.
 
-### 2. Set secret
+### 2. Buat database D1
+
+```powershell
+npx wrangler d1 create bot-tele-db
+```
+
+Salin `database_id` ke `wrangler.jsonc`:
+
+```jsonc
+"d1_databases": [
+  { "binding": "DB", "database_name": "bot-tele-db", "database_id": "<DATABASE_ID>" }
+]
+```
+
+Terapkan skema:
+
+```powershell
+npx wrangler d1 execute bot-tele-db --remote --file=schema.sql
+```
+
+### 3. Binding AI
+
+`wrangler.jsonc`:
+
+```jsonc
+"ai": { "binding": "AI" }
+```
+
+Tidak perlu API key.
+
+### 4. Set secret
 
 ```powershell
 "<BOT_TOKEN>"      | npx wrangler secret put BOT_TOKEN
 "<WEBHOOK_SECRET>" | npx wrangler secret put WEBHOOK_SECRET
+"<TERABOX_COOKIE>" | npx wrangler secret put TERABOX_COOKIE   # opsional
 ```
 
-`WEBHOOK_SECRET` adalah string acak 32 karakter hex (`[A-Za-z0-9_-]`). Nilai ini dipakai untuk:
+`WEBHOOK_SECRET` string acak 32 karakter (`[A-Za-z0-9_-]`). Dipakai untuk:
 
 - path webhook `/tg/<secret>`
 - header `X-Telegram-Bot-Api-Secret-Token`
 - signing URL `/dl/<token>`
+- path webhook GitHub `/gh/<secret>`
 
-### 3. Deploy
+### 5. Deploy
 
 ```powershell
 npx wrangler deploy
 ```
 
-### 4. Daftarkan webhook
+Cron `* * * * *` ikut terpasang otomatis.
+
+### 6. Daftarkan webhook
 
 ```powershell
 $env:BOT_TOKEN="<BOT_TOKEN>"
 $env:WEBHOOK_SECRET="<WEBHOOK_SECRET>"
 $env:PUBLIC_URL="https://bot-tele.awand795.workers.dev"
-node scripts/set-webhook.mjs
+node scripts/set-webhook.mjs   # sudah termasuk inline_query
 ```
 
-Cek status webhook:
+### 7. Aktifkan inline mode (sekali saja, manual)
 
-```powershell
-$env:BOT_TOKEN="<BOT_TOKEN>"; node scripts/webhook-info.mjs
+Bot API tidak bisa mengaktifkan inline mode. Di **@BotFather**:
+
 ```
+/setinline  → pilih bot → isi placeholder: "Cari video atau tempel link"
+/setinlinefeedback → pilih bot → Enabled (opsional)
+```
+
+Setelah itu ketik `@adnawaa_bot <judul/link>` di chat mana pun.
 
 ---
 
 ## Development lokal
 
-Buat file `.dev.vars` (jangan di-commit):
+`.dev.vars` (jangan di-commit):
 
 ```
 BOT_TOKEN=...
 WEBHOOK_SECRET=...
 ```
 
-Jalankan:
-
 ```powershell
 npx wrangler dev
 npx tsc --noEmit
 ```
 
-Untuk menerima webhook saat development, gunakan tunnel (cloudflared/ngrok), lalu daftarkan URL tunnel sebagai webhook.
+Untuk webhook saat development, pakai tunnel (cloudflared/ngrok) lalu daftarkan URL tunnel.
 
 ---
 
@@ -236,17 +327,72 @@ Untuk menerima webhook saat development, gunakan tunnel (cloudflared/ngrok), lal
 | Endpoint | Fungsi |
 | --- | --- |
 | `GET /health` | Cek Worker hidup |
-| `GET /_debug?key=&url=` | Hasil ekstraksi tanpa mengirim ke Telegram |
+| `GET /_debug?key=&url=` | Hasil ekstraksi tanpa kirim ke Telegram |
 | `GET /_link?key=&url=&mode=audio` | Signed `/dl` URL untuk tes streaming |
 | `GET /_send?key=&chat=&url=&mode=` | Tes kirim langsung ke chat |
 | `GET /_chats?key=` | Daftar chat yang pernah `/start` |
-| `GET /_probe?key=&url=` | Probe request keluar (diagnosa) |
+| `GET /_probe?key=&url=` | Probe request keluar |
+| `GET /_ai?key=&model=&prompt=` | Tes model Workers AI + ringkasan output |
+| `GET /_cron?key=&job=feeds\|monitors\|alerts\|all` | Jalankan job cron manual |
 
 Contoh:
 
 ```
 /_debug?key=SECRET&url=https%3A%2F%2Fyoutu.be%2FdQw4w9WgXcQ
+/_ai?key=SECRET&model=@cf/meta/llama-3.3-70b-instruct-fp8-fast&prompt=halo
 ```
+
+---
+
+## Kendala yang diketahui
+
+### 1. TeraBox butuh cookie
+
+TeraBox menolak request anonim dengan captcha (`verify_v2`). Alternatif pihak ketiga juga memblokir IP Worker. Supaya aktif, isi secret `TERABOX_COOKIE` dengan cookie akun TeraBox.
+
+### 2. Instagram sering `429`
+
+Instagram membatasi IP datacenter. Bot sudah mencoba web API, app API, dan embed; jika semuanya gagal, tampil pesan error.
+
+### 3. TikTok `Free Api Limit: 1 request/second`
+
+Fallback scrape `__UNIVERSAL_DATA_FOR_REHYDRATION__` sudah aktif, jadi video/foto/audio tetap bisa diambil.
+
+### 4. YouTube hanya 360p
+
+Free plan tidak memungkinkan remux/ffmpeg. Format muxed tanpa remux: **itag 18 (360p)**; audio: **itag 140 (M4A)**.
+
+### 5. Model AI pernah deprecated
+
+`@cf/meta/llama-3.1-8b-instruct` di-deprecate 30 Mei 2026. Kode sekarang memakai:
+
+```
+@cf/meta/llama-3.3-70b-instruct-fp8-fast
+@cf/meta/llama-3.1-8b-instruct-fp8      (fallback)
+@cf/meta/llama-3.2-3b-instruct         (fallback)
+```
+
+Jika Cloudflare mengganti model lagi, tes lewat `/_ai` lalu update `CHAT_MODELS` di `src/features/ai.ts`.
+
+### 6. TTS mengirim WAV
+
+MeloTTS menghasilkan WAV, sedangkan `sendAudio` Telegram hanya menerima MP3/M4A. Karena tidak ada ffmpeg di free plan, hasil TTS dikirim sebagai **dokumen WAV** (bisa diputar di kebanyakan client).
+
+### 7. Feed RSS bisa timeout
+
+Beberapa feed (mis. hnrss.org) kadang > 15 detik dari IP Worker. Item akan dicoba lagi pada siklus berikutnya.
+
+### 8. Batas Cloudflare Workers Free
+
+- CPU **10 ms/request** → tanpa remux/transcode.
+- KV **1.000 write/hari** → state, cache, rate limit, dedupe.
+- D1 free: 5 juta baris dibaca/hari, 100 ribu baris ditulis/hari.
+- Cron minimum **1 menit**.
+
+### 9. Batas Telegram
+
+- URL fetch maksimal **20 MB**, multipart maksimal **50 MB** → threshold bot **45 MB**.
+- `callback_data` maksimal 64 byte → file_id tidak dimasukkan ke callback (pakai ID vault).
 
 ---
 
@@ -254,42 +400,39 @@ Contoh:
 
 | Gejala | Kemungkinan penyebab | Solusi |
 | --- | --- | --- |
-| Bot diam saja | Webhook salah / secret beda | Cek `webhook-info.mjs`, lihat `last_error_message` |
-| `401 Unauthorized` dari Telegram | `BOT_TOKEN` salah | Set ulang secret `BOT_TOKEN` |
+| Bot diam | Webhook salah / secret beda | Cek `webhook-info.mjs`, lihat `last_error_message` |
+| `401 Unauthorized` | `BOT_TOKEN` salah | Set ulang secret |
+| `Database sedang tidak bisa diakses` | D1 binding salah / skema belum diterapkan | Cek `wrangler.jsonc`, jalankan `schema.sql` |
+| AI error `deprecated` | Model dihapus Cloudflare | Tes `/_ai`, update `CHAT_MODELS` |
+| AI error kuota | Batas 20/hari | Tunggu besok |
+| `/img` error properti | Skema input model berubah | Tes `/_ai`, sesuaikan input |
 | Video gagal terkirim | Telegram gagal fetch `/dl` | Tes `/_link`, pastikan Range `206` |
-| `429` Instagram | Rate limit IP | Tunggu beberapa saat / pakai link lain |
-| `Free Api Limit` TikTok | Limit tikwm | Fallback scrape otomatis aktif |
-| Upload > 20 MB gagal | `Content-Length` pada stream | Fallback ke link (memang desain) |
+| `429` Instagram | Rate limit IP | Tunggu / pakai link lain |
+| Alert harga tidak masuk | CoinGecko 429 | Fallback Binance otomatis; cek `/alert` |
+| Inline tidak muncul | Inline mode belum aktif | `/setinline` di @BotFather |
 | KV write habis | Batas 1.000/hari | Kurangi cache/state write |
 
 ---
 
-## Roadmap di rumah
+## Roadmap
 
 - [ ] Instagram: fallback GraphQL + pesan error lebih jelas
 - [ ] TikTok: cache hasil per URL
 - [ ] YouTube: opsi kualitas lain saat sudah pakai Paid plan
 - [ ] Album/carousel: caption per item
-- [ ] Tes upload streaming 20–45 MB dengan file nyata
-- [ ] Tes end-to-end dari Telegram (video, audio, foto)
+- [ ] TeraBox: aktifkan setelah cookie tersedia
+- [ ] Auto-backup harian ke chat owner
 - [ ] Rotasi token Cloudflare & token bot
-- [ ] TeraBox: lanjutkan setelah cookie tersedia
-
----
-
-## TeraBox (pending)
-
-TeraBox menolak request anonim dengan captcha (`verify_v2`). Supaya aktif, perlu cookie akun TeraBox yang disimpan sebagai secret `TERABOX_COOKIE`. Tanpa cookie, menu TeraBox tetap tampil tetapi menjawab bahwa fitur sedang butuh cookie.
 
 ---
 
 ## Keamanan
 
 - Token Cloudflare dan token bot **pernah terekspos di chat** → rotasi setelah bot stabil.
-- Jangan pernah commit `.dev.vars`, `.webhook-secret.local`, atau cookie apa pun.
+- Jangan commit `.dev.vars`, `.webhook-secret.local`, atau cookie apa pun.
 - Repo ini **public** — kredensial hanya boleh disimpan sebagai **Worker secrets**.
-- `.gitignore` sudah mencakup:
-  `node_modules/`, `.wrangler/`, `.dev.vars`, `*.log`, `.env`, `.webhook-secret.local`.
+- `.gitignore`: `node_modules/`, `.wrangler/`, `.dev.vars`, `*.log`, `.env`, `.webhook-secret.local`.
+- Bot default **owner-only**; user baru harus di-`/allow`.
 
 ---
 
