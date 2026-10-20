@@ -1,8 +1,12 @@
 import type { Ctx } from "./context";
 import { qAll, qFirst, qRun } from "../db";
 import type { Env } from "../env";
-import { esc, sendMessage } from "../telegram";
+import { editMessage, esc, sendMessage } from "../telegram";
 import { getSetting } from "../users";
+import { formatWib } from "../time";
+
+export type MonitorStatus = "up" | "protected" | "down";
+export type IntervalKind = "monitor" | "rss" | "alert";
 
 interface FeedRow {
   id: number;
@@ -12,6 +16,7 @@ interface FeedRow {
   title: string | null;
   last_seen: string | null;
   last_checked: number | null;
+  interval_min: number;
 }
 interface MonitorRow {
   id: number;
@@ -20,6 +25,8 @@ interface MonitorRow {
   url: string;
   status: string | null;
   last_checked: number | null;
+  interval_min: number;
+  paused: number;
 }
 interface AlertRow {
   id: number;
@@ -28,12 +35,70 @@ interface AlertRow {
   symbol: string;
   op: string;
   target: number;
+  interval_min: number;
+  last_checked: number | null;
 }
 
-/* -------------------------------- RSS -------------------------------- */
+export interface ProbeResult {
+  status: MonitorStatus;
+  code: number;
+  ms: number;
+  via?: string;
+  note?: string;
+}
 
 const FEED_UA = "Mozilla/5.0 (compatible; AdnawaaBot/1.0; +https://github.com/awand795/bot-tele)";
 const API_UA = "AdnawaaBot/1.0 (+https://github.com/awand795/bot-tele)";
+
+const INTERVAL_DEFAULTS: Record<IntervalKind, number> = { monitor: 5, rss: 10, alert: 15 };
+const INTERVAL_LIMITS: Record<IntervalKind, [number, number]> = {
+  monitor: [1, 1440],
+  rss: [5, 1440],
+  alert: [5, 1440],
+};
+
+export async function getIntervalDefault(env: Env, kind: IntervalKind): Promise<number> {
+  const raw = await getSetting(env, `interval_${kind}`);
+  const value = Number(raw);
+  const [min, max] = INTERVAL_LIMITS[kind];
+  if (Number.isFinite(value) && value >= min) return Math.min(value, max);
+  return INTERVAL_DEFAULTS[kind];
+}
+
+export function validateInterval(kind: IntervalKind, value: number): number | null {
+  const [min, max] = INTERVAL_LIMITS[kind];
+  if (!Number.isFinite(value) || value < min || value > max) return null;
+  return Math.round(value);
+}
+
+export function intervalRange(kind: IntervalKind): string {
+  const [min, max] = INTERVAL_LIMITS[kind];
+  return `${min}–${max} menit`;
+}
+
+function statusIcon(status: string | null | undefined): string {
+  if (status === "up") return "🟢";
+  if (status === "protected") return "🟡";
+  return "🔴";
+}
+
+function statusLabel(status: string | null | undefined): string {
+  if (status === "up") return "online";
+  if (status === "protected") return "terproteksi";
+  return "down";
+}
+
+function shortUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname === "/" ? "" : parsed.pathname;
+    return `${parsed.host}${path}`.slice(0, 48);
+  } catch {
+    return url.slice(0, 48);
+  }
+}
+
+/* -------------------------------- RSS -------------------------------- */
 
 function decodeEntities(text: string): string {
   return text
@@ -84,16 +149,41 @@ async function fetchFeed(url: string): Promise<{ title: string; items: Array<{ i
   return parsed;
 }
 
-export async function addRss(env: Env, userId: number, chatId: number, url: string): Promise<void> {
+function splitUrlInterval(args: string[]): { url: string; intervalRaw: string | null } {
+  const rest = [...args];
+  let intervalRaw: string | null = null;
+  if (rest.length > 1 && /^\d+$/.test(rest[rest.length - 1])) {
+    intervalRaw = rest.pop()!;
+  }
+  return { url: rest.join(" ").trim(), intervalRaw };
+}
+
+export async function addRss(env: Env, userId: number, chatId: number, url: string, intervalArg?: string): Promise<void> {
   if (!/^https?:\/\//i.test(url)) {
-    await sendMessage(env, chatId, "❌ Kirim URL feed yang valid. Contoh:\n<code>/rss add https://hnrss.org/frontpage</code>");
+    await sendMessage(
+      env,
+      chatId,
+      "❌ Kirim URL feed yang valid. Contoh:\n<code>/rss add https://hnrss.org/frontpage</code>",
+    );
     return;
   }
+
+  let interval = await getIntervalDefault(env, "rss");
+  if (intervalArg) {
+    const parsed = validateInterval("rss", Number(intervalArg));
+    if (parsed === null) {
+      await sendMessage(env, chatId, `❌ Interval RSS harus ${intervalRange("rss")}.`);
+      return;
+    }
+    interval = parsed;
+  }
+
   const count = await qFirst<{ n: number }>(env, "SELECT COUNT(*) AS n FROM feeds WHERE user_id = ?", userId);
   if ((count?.n ?? 0) >= 5) {
     await sendMessage(env, chatId, "❌ Maksimal 5 feed per user. Hapus dulu dengan /rss del &lt;id&gt;.");
     return;
   }
+
   let feed: Awaited<ReturnType<typeof fetchFeed>>;
   try {
     feed = await fetchFeed(url);
@@ -101,38 +191,59 @@ export async function addRss(env: Env, userId: number, chatId: number, url: stri
     await sendMessage(env, chatId, `❌ Feed tidak bisa dibaca: ${esc((err as Error).message)}`);
     return;
   }
+
   await qRun(
     env,
-    "INSERT INTO feeds(user_id, chat_id, url, title, last_seen, last_checked, created_at) VALUES(?,?,?,?,?,?,?)",
+    "INSERT INTO feeds(user_id, chat_id, url, title, last_seen, last_checked, interval_min, created_at) VALUES(?,?,?,?,?,?,?,?)",
     userId,
     chatId,
     url,
     feed.title,
     feed.items[0].id,
     Date.now(),
+    interval,
     Date.now(),
   );
   await sendMessage(
     env,
     chatId,
     `📡 <b>Feed ditambahkan</b>\n\n${esc(feed.title || url)}\n${esc(feed.items[0].title)}\n\n` +
-      `<i>Cek otomatis tiap ±10 menit.</i>`,
+      `⏱ Cek tiap <b>${interval} menit</b>.`,
   );
 }
 
 export async function cmdRss(ctx: Ctx): Promise<void> {
   const sub = (ctx.args[0] ?? "").toLowerCase();
+
   if (sub === "add") {
-    return addRss(ctx.env, ctx.userId, ctx.chatId, ctx.args.slice(1).join(" ").trim());
+    const { url, intervalRaw } = splitUrlInterval(ctx.args.slice(1));
+    return addRss(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
   }
+
+  if (sub === "every" || sub === "interval") {
+    const id = Number(ctx.args[1]);
+    const interval = validateInterval("rss", Number(ctx.args[2]));
+    if (!Number.isFinite(id) || interval === null) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        `Contoh: <code>/rss every 3 30</code>\nInterval: ${intervalRange("rss")}.`,
+      );
+    }
+    await qRun(ctx.env, "UPDATE feeds SET interval_min = ? WHERE id = ? AND user_id = ?", interval, id, ctx.userId);
+    return sendMessage(ctx.env, ctx.chatId, `⏱ Feed #${id} sekarang dicek tiap <b>${interval} menit</b>.`);
+  }
+
   if (sub === "del" || sub === "delete") {
     const id = Number(ctx.args[1]);
     if (!Number.isFinite(id)) return sendMessage(ctx.env, ctx.chatId, "Contoh: <code>/rss del 3</code>");
     await qRun(ctx.env, "DELETE FROM feeds WHERE id = ? AND user_id = ?", id, ctx.userId);
     return sendMessage(ctx.env, ctx.chatId, `🗑 Feed #${id} dihapus.`);
   }
+
   if (ctx.args.length) {
-    return addRss(ctx.env, ctx.userId, ctx.chatId, ctx.args.join(" ").trim());
+    const { url, intervalRaw } = splitUrlInterval(ctx.args);
+    return addRss(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
   }
 
   const rows = await qAll<FeedRow>(ctx.env, "SELECT * FROM feeds WHERE user_id = ? ORDER BY id", ctx.userId);
@@ -140,71 +251,279 @@ export async function cmdRss(ctx: Ctx): Promise<void> {
     await sendMessage(
       ctx.env,
       ctx.chatId,
-      "📡 <b>RSS Monitor</b>\n\nTambah: <code>/rss add https://hnrss.org/frontpage</code>\nDaftar: /rss",
+      "📡 <b>RSS Monitor</b>\n\n" +
+        "Tambah: <code>/rss add https://hnrss.org/frontpage</code>\n" +
+        "Dengan interval: <code>/rss add &lt;url&gt; 30</code>\n\n" +
+        `<i>Default ${await getIntervalDefault(ctx.env, "rss")} menit.</i>`,
     );
     return;
   }
+
   const lines = ["📡 <b>Feed kamu</b>", ""];
   const keyboard: any[] = [];
   for (const row of rows) {
-    lines.push(`<b>#${row.id}</b> ${esc(row.title || row.url)}`);
+    const title = row.title || shortUrl(row.url);
+    lines.push(`<b>#${row.id}</b> ${esc(title)} · tiap ${row.interval_min ?? 10}m`);
     keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `rss_del:${row.id}` }]);
   }
+  lines.push("", "<i>Ubah interval: /rss every &lt;id&gt; &lt;menit&gt;</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 
 /* ------------------------------ uptime ------------------------------- */
 
-async function probe(url: string): Promise<{ status: string; code?: number }> {
+function isIpLiteral(host: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function nipUrl(raw: string): string | null {
   try {
-    const res = await fetch(url, {
-      headers: { "user-agent": FEED_UA },
-      signal: AbortSignal.timeout(12_000),
-      redirect: "follow",
-    });
-    return { status: res.ok ? "up" : "down", code: res.status };
-  } catch (err) {
-    return { status: "down", code: 0 };
+    const url = new URL(raw);
+    if (!isIpLiteral(url.hostname)) return null;
+    return `${url.protocol}//${url.hostname}.nip.io${url.port ? `:${url.port}` : ""}${url.pathname}${url.search}`;
+  } catch {
+    return null;
   }
 }
 
-export async function addMonitor(env: Env, userId: number, chatId: number, url: string): Promise<void> {
+function classify(code: number): MonitorStatus {
+  if (code >= 200 && code < 400) return "up";
+  if (code === 401 || code === 403 || code === 429) return "protected";
+  return "down";
+}
+
+async function fetchStatus(url: string, timeout = 12_000): Promise<{ status: number; ms: number; body: string }> {
+  const started = Date.now();
+  const res = await fetch(url, {
+    headers: { "user-agent": FEED_UA },
+    redirect: "follow",
+    signal: AbortSignal.timeout(timeout),
+  });
+  const ms = Date.now() - started;
+  let body = "";
+  if (res.status === 403) body = (await res.text().catch(() => "")).slice(0, 300);
+  return { status: res.status, ms, body };
+}
+
+export async function probe(url: string): Promise<ProbeResult> {
+  try {
+    const first = await fetchStatus(url);
+    let result = first;
+    let via: string | undefined;
+    let note: string | undefined;
+
+    if (first.status === 403 && first.body.includes("1003")) {
+      const alt = nipUrl(url);
+      if (alt) {
+        try {
+          const second = await fetchStatus(alt);
+          if (!(second.status === 403 && second.body.includes("1003"))) {
+            result = second;
+            via = alt;
+          } else {
+            note = "Cloudflare menolak akses langsung (1003). Coba pakai hostname/domain, bukan IP.";
+          }
+        } catch {
+          note = "Cloudflare menolak akses langsung (1003). Coba pakai hostname/domain, bukan IP.";
+        }
+      } else {
+        note = "Cloudflare menolak akses langsung (1003).";
+      }
+    }
+
+    if (result.status === 403 && result.body.includes("1003")) {
+      return { status: "down", code: 403, ms: result.ms, via, note };
+    }
+
+    return { status: classify(result.status), code: result.status, ms: result.ms, via, note };
+  } catch {
+    return { status: "down", code: 0, ms: 0 };
+  }
+}
+
+function monitorStatusLine(row: MonitorRow, result?: ProbeResult): string {
+  const status = result?.status ?? row.status;
+  const code = result?.code;
+  const ms = result?.ms;
+  return `${statusIcon(status)} <b>${statusLabel(status)}</b>${code ? ` (${code})` : ""}${ms ? ` · ${ms} ms` : ""}`;
+}
+
+function monitorDetailText(row: MonitorRow, result?: ProbeResult): string {
+  const lines = [
+    `📈 <b>Monitor #${row.id}</b>`,
+    esc(row.url),
+    "",
+    `Status: ${monitorStatusLine(row, result)}`,
+    `Cek terakhir: ${row.last_checked ? formatWib(row.last_checked) : "belum pernah"}`,
+    `Interval: <b>${row.interval_min ?? 5} menit</b>`,
+    `Keadaan: <b>${row.paused ? "⏸ dijeda" : "▶️ aktif"}</b>`,
+  ];
+  if (result?.via) lines.push(`Via: ${esc(result.via)}`);
+  if (result?.note) lines.push(`\n⚠️ ${esc(result.note)}`);
+  return lines.join("\n");
+}
+
+function monitorDetailKeyboard(row: MonitorRow): any {
+  return {
+    inline_keyboard: [
+      [{ text: "🔄 Cek Sekarang", callback_data: `mon_check:${row.id}` }],
+      [
+        { text: "1m", callback_data: `mon_every:${row.id}:1` },
+        { text: "5m", callback_data: `mon_every:${row.id}:5` },
+        { text: "15m", callback_data: `mon_every:${row.id}:15` },
+        { text: "60m", callback_data: `mon_every:${row.id}:60` },
+      ],
+      [
+        {
+          text: row.paused ? "▶️ Aktifkan" : "⏸ Jeda",
+          callback_data: row.paused ? `mon_resume:${row.id}` : `mon_pause:${row.id}`,
+        },
+        { text: "🗑 Hapus", callback_data: `mon_del:${row.id}` },
+      ],
+      [{ text: "⬅️ Daftar Monitor", callback_data: "menu:uptime" }],
+    ],
+  };
+}
+
+async function probeAndStore(env: Env, row: MonitorRow): Promise<ProbeResult> {
+  const result = await probe(row.url);
+  const now = Date.now();
+  await qRun(env, "UPDATE monitors SET status = ?, last_checked = ? WHERE id = ?", result.status, now, row.id);
+  row.status = result.status;
+  row.last_checked = now;
+  return result;
+}
+
+export async function addMonitor(
+  env: Env,
+  userId: number,
+  chatId: number,
+  url: string,
+  intervalArg?: string,
+): Promise<void> {
   if (!/^https?:\/\//i.test(url)) {
     await sendMessage(env, chatId, "❌ Kirim URL yang valid. Contoh:\n<code>/monitor add https://example.com</code>");
     return;
   }
+
+  let interval = await getIntervalDefault(env, "monitor");
+  if (intervalArg) {
+    const parsed = validateInterval("monitor", Number(intervalArg));
+    if (parsed === null) {
+      await sendMessage(env, chatId, `❌ Interval monitor harus ${intervalRange("monitor")}.`);
+      return;
+    }
+    interval = parsed;
+  }
+
   const count = await qFirst<{ n: number }>(env, "SELECT COUNT(*) AS n FROM monitors WHERE user_id = ?", userId);
   if ((count?.n ?? 0) >= 5) {
     await sendMessage(env, chatId, "❌ Maksimal 5 monitor per user.");
     return;
   }
-  const now = await probe(url);
+
+  const result = await probe(url);
   await qRun(
     env,
-    "INSERT INTO monitors(user_id, chat_id, url, status, last_checked, created_at) VALUES(?,?,?,?,?,?)",
+    "INSERT INTO monitors(user_id, chat_id, url, status, last_checked, interval_min, paused, created_at) VALUES(?,?,?,?,?,?,0,?)",
     userId,
     chatId,
     url,
-    now.status,
+    result.status,
     Date.now(),
+    interval,
     Date.now(),
   );
-  await sendMessage(
-    env,
-    chatId,
-    `${now.status === "up" ? "🟢" : "🔴"} <b>Monitor ditambahkan</b>\n\n${esc(url)}\nStatus: ${now.status}${
-      now.code ? ` (${now.code})` : ""
-    }\n\n<i>Cek tiap ±5 menit.</i>`,
-  );
+
+  const lines = [
+    `${statusIcon(result.status)} <b>Monitor ditambahkan</b>`,
+    "",
+    esc(url),
+    `Status: <b>${statusLabel(result.status)}</b>${result.code ? ` (${result.code})` : ""}${result.ms ? ` · ${result.ms} ms` : ""}`,
+    `⏱ Cek tiap <b>${interval} menit</b>.`,
+  ];
+  if (result.via) lines.push(`Via: ${esc(result.via)}`);
+  if (result.note) lines.push(`\n⚠️ ${esc(result.note)}`);
+  if (result.status === "protected") {
+    lines.push("\n<i>Server merespons, tapi akses dibatasi (login/Cloudflare).</i>");
+  }
+  await sendMessage(env, chatId, lines.join("\n"));
 }
 
 export async function cmdMonitor(ctx: Ctx): Promise<void> {
   const sub = (ctx.args[0] ?? "").toLowerCase();
-  if (sub === "add") return addMonitor(ctx.env, ctx.userId, ctx.chatId, ctx.args.slice(1).join(" ").trim());
+
+  if (sub === "add") {
+    const { url, intervalRaw } = splitUrlInterval(ctx.args.slice(1));
+    return addMonitor(ctx.env, ctx.userId, ctx.chatId, url, intervalRaw ?? undefined);
+  }
+
   if (sub === "del" || sub === "delete") {
     const id = Number(ctx.args[1]);
     await qRun(ctx.env, "DELETE FROM monitors WHERE id = ? AND user_id = ?", id, ctx.userId);
     return sendMessage(ctx.env, ctx.chatId, `🗑 Monitor #${id} dihapus.`);
+  }
+
+  if (sub === "test" || sub === "check") {
+    const id = Number(ctx.args[1]);
+    const row = await qFirst<MonitorRow>(
+      ctx.env,
+      "SELECT * FROM monitors WHERE id = ? AND user_id = ?",
+      id,
+      ctx.userId,
+    );
+    if (!row) return sendMessage(ctx.env, ctx.chatId, "❌ Monitor tidak ditemukan.");
+    const result = await probeAndStore(ctx.env, row);
+    await sendMessage(ctx.env, ctx.chatId, monitorDetailText(row, result), {
+      keyboard: monitorDetailKeyboard(row),
+    });
+    return;
+  }
+
+  if (sub === "every" || sub === "interval") {
+    const id = Number(ctx.args[1]);
+    const interval = validateInterval("monitor", Number(ctx.args[2]));
+    if (!Number.isFinite(id) || interval === null) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        `Contoh: <code>/monitor every 2 10</code>\nInterval: ${intervalRange("monitor")}.`,
+      );
+    }
+    await qRun(
+      ctx.env,
+      "UPDATE monitors SET interval_min = ? WHERE id = ? AND user_id = ?",
+      interval,
+      id,
+      ctx.userId,
+    );
+    return sendMessage(ctx.env, ctx.chatId, `⏱ Monitor #${id} sekarang dicek tiap <b>${interval} menit</b>.`);
+  }
+
+  if (sub === "pause" || sub === "resume") {
+    const id = Number(ctx.args[1]);
+    if (!Number.isFinite(id)) return sendMessage(ctx.env, ctx.chatId, "Contoh: <code>/monitor pause 2</code>");
+    await qRun(
+      ctx.env,
+      "UPDATE monitors SET paused = ? WHERE id = ? AND user_id = ?",
+      sub === "pause" ? 1 : 0,
+      id,
+      ctx.userId,
+    );
+    return sendMessage(ctx.env, ctx.chatId, sub === "pause" ? `⏸ Monitor #${id} dijeda.` : `▶️ Monitor #${id} aktif.`);
+  }
+
+  if (ctx.args.length) {
+    return sendMessage(
+      ctx.env,
+      ctx.chatId,
+      "📈 <b>Monitor</b>\n\n" +
+        "<code>/monitor add &lt;url&gt; [menit]</code>\n" +
+        "<code>/monitor test &lt;id&gt;</code>\n" +
+        "<code>/monitor every &lt;id&gt; &lt;menit&gt;</code>\n" +
+        "<code>/monitor pause|resume &lt;id&gt;</code>\n" +
+        "<code>/monitor del &lt;id&gt;</code>",
+    );
   }
 
   const rows = await qAll<MonitorRow>(ctx.env, "SELECT * FROM monitors WHERE user_id = ? ORDER BY id", ctx.userId);
@@ -212,17 +531,76 @@ export async function cmdMonitor(ctx: Ctx): Promise<void> {
     await sendMessage(
       ctx.env,
       ctx.chatId,
-      "📈 <b>Uptime Monitor</b>\n\nTambah: <code>/monitor add https://example.com</code>",
+      "📈 <b>Uptime Monitor</b>\n\n" +
+        "Tambah: <code>/monitor add https://example.com</code>\n" +
+        "Dengan interval: <code>/monitor add &lt;url&gt; 10</code>\n\n" +
+        `<i>Default ${await getIntervalDefault(ctx.env, "monitor")} menit.</i>`,
     );
     return;
   }
+
   const lines = ["📈 <b>Monitor kamu</b>", ""];
   const keyboard: any[] = [];
   for (const row of rows) {
-    lines.push(`${row.status === "up" ? "🟢" : "🔴"} <b>#${row.id}</b> ${esc(row.url)}`);
-    keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `mon_del:${row.id}` }]);
+    lines.push(
+      `${statusIcon(row.status)} <b>#${row.id}</b> ${esc(shortUrl(row.url))} · ${row.interval_min ?? 5}m${
+        row.paused ? " · ⏸" : ""
+      }`,
+    );
+    keyboard.push([
+      { text: `${statusIcon(row.status)} #${row.id} ${shortUrl(row.url)}`.slice(0, 60), callback_data: `mon_view:${row.id}` },
+    ]);
   }
+  lines.push("", "<i>Klik monitor untuk detail, cek sekarang, atau ubah interval.</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
+}
+
+export async function handleMonitorCallback(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  userId: number,
+  data: string,
+): Promise<boolean> {
+  const [action, rawId, rawValue] = data.split(":");
+  const id = Number(rawId);
+  if (!["mon_view", "mon_check", "mon_every", "mon_pause", "mon_resume"].includes(action)) return false;
+  if (!Number.isFinite(id)) return false;
+
+  const row = await qFirst<MonitorRow>(env, "SELECT * FROM monitors WHERE id = ? AND user_id = ?", id, userId);
+  if (!row) {
+    await editMessage(env, chatId, messageId, "❌ Monitor tidak ditemukan.", { keyboard: backMenu() });
+    return true;
+  }
+
+  if (action === "mon_view") {
+    await editMessage(env, chatId, messageId, monitorDetailText(row), { keyboard: monitorDetailKeyboard(row) });
+    return true;
+  }
+
+  if (action === "mon_check") {
+    await editMessage(env, chatId, messageId, `⏳ Mengecek <code>${esc(shortUrl(row.url))}</code>…`).catch(() => undefined);
+    const result = await probeAndStore(env, row);
+    await editMessage(env, chatId, messageId, monitorDetailText(row, result), {
+      keyboard: monitorDetailKeyboard(row),
+    });
+    return true;
+  }
+
+  if (action === "mon_every") {
+    const interval = validateInterval("monitor", Number(rawValue));
+    if (interval === null) return true;
+    await qRun(env, "UPDATE monitors SET interval_min = ? WHERE id = ?", interval, id);
+    row.interval_min = interval;
+    await editMessage(env, chatId, messageId, monitorDetailText(row), { keyboard: monitorDetailKeyboard(row) });
+    return true;
+  }
+
+  const paused = action === "mon_pause" ? 1 : 0;
+  await qRun(env, "UPDATE monitors SET paused = ? WHERE id = ?", paused, id);
+  row.paused = paused;
+  await editMessage(env, chatId, messageId, monitorDetailText(row), { keyboard: monitorDetailKeyboard(row) });
+  return true;
 }
 
 /* ------------------------------- alert ------------------------------- */
@@ -247,16 +625,34 @@ const COINS: Record<string, string> = {
 
 export async function cmdAlert(ctx: Ctx): Promise<void> {
   const sub = (ctx.args[0] ?? "").toLowerCase();
+
   if (sub === "del" || sub === "delete") {
     const id = Number(ctx.args[1]);
     await qRun(ctx.env, "DELETE FROM alerts WHERE id = ? AND user_id = ?", id, ctx.userId);
     return sendMessage(ctx.env, ctx.chatId, `🗑 Alert #${id} dihapus.`);
   }
 
-  if (ctx.args.length >= 3) {
-    const symbol = ctx.args[0].toUpperCase();
+  if (sub === "every" || sub === "interval") {
+    const id = Number(ctx.args[1]);
+    const interval = validateInterval("alert", Number(ctx.args[2]));
+    if (!Number.isFinite(id) || interval === null) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        `Contoh: <code>/alert every 1 30</code>\nInterval: ${intervalRange("alert")}.`,
+      );
+    }
+    await qRun(ctx.env, "UPDATE alerts SET interval_min = ? WHERE id = ? AND user_id = ?", interval, id, ctx.userId);
+    return sendMessage(ctx.env, ctx.chatId, `⏱ Alert #${id} sekarang dicek tiap <b>${interval} menit</b>.`);
+  }
+
+  const creating = ["<", ">"].includes(ctx.args[1] ?? "") || ctx.args.length >= 3;
+  if (creating) {
+    const symbol = (ctx.args[0] ?? "").toUpperCase();
     const op = ctx.args[1];
     const target = Number(ctx.args[2]);
+    const explicitInterval = ctx.args[3];
+
     if (!COINS[symbol] || !["<", ">"].includes(op) || !Number.isFinite(target)) {
       return sendMessage(
         ctx.env,
@@ -264,24 +660,41 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
         "❌ Format: <code>/alert BTC &gt; 100000</code>\nKoin: " + Object.keys(COINS).join(", "),
       );
     }
-    const count = await qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM alerts WHERE user_id = ?", ctx.userId);
+
+    let interval = await getIntervalDefault(ctx.env, "alert");
+    if (explicitInterval) {
+      const parsed = validateInterval("alert", Number(explicitInterval));
+      if (parsed === null) {
+        return sendMessage(ctx.env, ctx.chatId, `❌ Interval alert harus ${intervalRange("alert")}.`);
+      }
+      interval = parsed;
+    }
+
+    const count = await qFirst<{ n: number }>(
+      ctx.env,
+      "SELECT COUNT(*) AS n FROM alerts WHERE user_id = ?",
+      ctx.userId,
+    );
     if ((count?.n ?? 0) >= 10) {
       return sendMessage(ctx.env, ctx.chatId, "❌ Maksimal 10 alert per user.");
     }
+
     await qRun(
       ctx.env,
-      "INSERT INTO alerts(user_id, chat_id, symbol, op, target, triggered, created_at) VALUES(?,?,?,?,?,0,?)",
+      "INSERT INTO alerts(user_id, chat_id, symbol, op, target, triggered, interval_min, last_checked, created_at) VALUES(?,?,?,?,?,0,?,NULL,?)",
       ctx.userId,
       ctx.chatId,
       symbol,
       op,
       target,
+      interval,
       Date.now(),
     );
     return sendMessage(
       ctx.env,
       ctx.chatId,
-      `🔔 Alert diset: <b>${symbol} ${op} ${target.toLocaleString("en-US")}</b> (USD)\n<i>Cek tiap ±15 menit.</i>`,
+      `🔔 Alert diset: <b>${symbol} ${op} ${target.toLocaleString("en-US")}</b> (USD)\n` +
+        `⏱ Cek tiap <b>${interval} menit</b>.`,
     );
   }
 
@@ -295,12 +708,18 @@ export async function cmdAlert(ctx: Ctx): Promise<void> {
         Object.keys(COINS).join(", "),
     );
   }
+
   const lines = ["🔔 <b>Alert kamu</b>", ""];
   const keyboard: any[] = [];
   for (const row of rows) {
-    lines.push(`<b>#${row.id}</b> ${row.symbol} ${row.op} ${row.target.toLocaleString("en-US")} USD`);
+    lines.push(
+      `<b>#${row.id}</b> ${row.symbol} ${row.op} ${row.target.toLocaleString("en-US")} USD · tiap ${
+        row.interval_min ?? 15
+      }m`,
+    );
     keyboard.push([{ text: `🗑 #${row.id}`, callback_data: `alert_del:${row.id}` }]);
   }
+  lines.push("", "<i>Ubah interval: /alert every &lt;id&gt; &lt;menit&gt;</i>");
   await sendMessage(ctx.env, ctx.chatId, lines.join("\n"), { keyboard: { inline_keyboard: keyboard } });
 }
 
@@ -315,7 +734,12 @@ async function safeSend(env: Env, chatId: number | string, text: string, keyboar
 }
 
 export async function checkFeeds(env: Env): Promise<void> {
-  const rows = await qAll<FeedRow>(env, "SELECT * FROM feeds ORDER BY COALESCE(last_checked, 0) ASC LIMIT 5");
+  const now = Date.now();
+  const rows = await qAll<FeedRow>(
+    env,
+    "SELECT * FROM feeds WHERE last_checked IS NULL OR last_checked + COALESCE(interval_min, 10) * 60000 <= ? ORDER BY COALESCE(last_checked, 0) ASC LIMIT 5",
+    now,
+  );
 
   await Promise.allSettled(
     rows.map(async (row) => {
@@ -350,21 +774,32 @@ export async function checkFeeds(env: Env): Promise<void> {
 }
 
 export async function checkMonitors(env: Env): Promise<void> {
-  const rows = await qAll<MonitorRow>(env, "SELECT * FROM monitors ORDER BY COALESCE(last_checked, 0) ASC LIMIT 5");
+  const now = Date.now();
+  const rows = await qAll<MonitorRow>(
+    env,
+    "SELECT * FROM monitors WHERE paused = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 5) * 60000 <= ?) ORDER BY COALESCE(last_checked, 0) ASC LIMIT 10",
+    now,
+  );
 
   await Promise.allSettled(
     rows.map(async (row) => {
+      const previous = row.status;
       const result = await probe(row.url);
-      if (row.status && row.status !== result.status) {
-        const ok = result.status === "up";
-        await safeSend(
-          env,
-          row.chat_id,
-          `${ok ? "🟢" : "🔴"} <b>${ok ? "Website kembali online" : "Website down"}</b>\n\n${esc(row.url)}${
-            result.code ? `\nKode: ${result.code}` : ""
-          }`,
-        );
+
+      if (previous && previous !== result.status) {
+        const lines: string[] = [];
+        if (result.status === "down") {
+          lines.push("🔴 <b>Website down</b>");
+        } else if (previous === "down") {
+          lines.push(result.status === "up" ? "🟢 <b>Website kembali online</b>" : "🟡 <b>Website kembali merespons</b>");
+        } else {
+          lines.push(result.status === "protected" ? "🟡 <b>Website terproteksi</b>" : "🟢 <b>Website normal kembali</b>");
+        }
+        lines.push("", esc(row.url), `Status: ${statusIcon(result.status)} ${statusLabel(result.status)}${result.code ? ` (${result.code})` : ""}`);
+        if (result.note) lines.push(`⚠️ ${esc(result.note)}`);
+        await safeSend(env, row.chat_id, lines.join("\n"));
       }
+
       await qRun(
         env,
         "UPDATE monitors SET status = ?, last_checked = ? WHERE id = ?",
@@ -377,7 +812,12 @@ export async function checkMonitors(env: Env): Promise<void> {
 }
 
 export async function checkAlerts(env: Env): Promise<void> {
-  const rows = await qAll<AlertRow>(env, "SELECT * FROM alerts WHERE triggered = 0");
+  const now = Date.now();
+  const rows = await qAll<AlertRow>(
+    env,
+    "SELECT * FROM alerts WHERE triggered = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 15) * 60000 <= ?) ORDER BY COALESCE(last_checked, 0) ASC LIMIT 50",
+    now,
+  );
   if (!rows.length) return;
 
   const ids = [...new Set(rows.map((r) => COINS[r.symbol]).filter(Boolean))];
@@ -417,18 +857,23 @@ export async function checkAlerts(env: Env): Promise<void> {
     );
   }
 
+  const checkedAt = Date.now();
   for (const row of rows) {
     const price = prices[COINS[row.symbol]]?.usd;
-    if (!Number.isFinite(price)) continue;
-    const hit = row.op === ">" ? price >= row.target : price <= row.target;
-    if (!hit) continue;
-    await safeSend(
-      env,
-      row.chat_id,
-      `🔔 <b>Alert tercapai</b>\n\n${row.symbol} sekarang <b>$${price.toLocaleString("en-US")}</b>\n` +
-        `Target: ${row.op} ${row.target.toLocaleString("en-US")}`,
-    );
-    await qRun(env, "UPDATE alerts SET triggered = 1 WHERE id = ?", row.id);
+    if (Number.isFinite(price)) {
+      const hit = row.op === ">" ? price >= row.target : price <= row.target;
+      if (hit) {
+        await safeSend(
+          env,
+          row.chat_id,
+          `🔔 <b>Alert tercapai</b>\n\n${row.symbol} sekarang <b>$${price.toLocaleString("en-US")}</b>\n` +
+            `Target: ${row.op} ${row.target.toLocaleString("en-US")}`,
+        );
+        await qRun(env, "UPDATE alerts SET triggered = 1, last_checked = ? WHERE id = ?", checkedAt, row.id);
+        continue;
+      }
+    }
+    await qRun(env, "UPDATE alerts SET last_checked = ? WHERE id = ?", checkedAt, row.id);
   }
 }
 
@@ -479,7 +924,9 @@ export async function handleGithubWebhook(env: Env, request: Request): Promise<R
     lines.push(`👤 ${esc(payload.pusher?.name ?? "")} · ${commits.length} commit`);
     lines.push(`🌿 ${esc(String(payload.ref ?? "").replace("refs/heads/", ""))}`);
     for (const commit of commits.slice(0, 4)) {
-      lines.push(`• <code>${esc(String(commit.id ?? "").slice(0, 7))}</code> ${esc(commit.message ?? "").split("\n")[0].slice(0, 90)}`);
+      lines.push(
+        `• <code>${esc(String(commit.id ?? "").slice(0, 7))}</code> ${esc(commit.message ?? "").split("\n")[0].slice(0, 90)}`,
+      );
     }
     if (payload.compare) lines.push(`\n<a href="${esc(payload.compare)}">Lihat diff</a>`);
   } else if (event === "issues") {
@@ -497,7 +944,11 @@ export async function handleGithubWebhook(env: Env, request: Request): Promise<R
     lines.push(`${esc(payload.release?.name ?? payload.release?.tag_name ?? "")}`);
     if (payload.release?.html_url) lines.push(`\n<a href="${esc(payload.release.html_url)}">Lihat release</a>`);
   } else if (event === "workflow_run") {
-    lines.push(`⚙️ <b>Workflow ${esc(payload.workflow_run?.name ?? "")}: ${esc(payload.workflow_run?.conclusion ?? payload.action ?? "")}</b>`);
+    lines.push(
+      `⚙️ <b>Workflow ${esc(payload.workflow_run?.name ?? "")}: ${esc(
+        payload.workflow_run?.conclusion ?? payload.action ?? "",
+      )}</b>`,
+    );
     if (payload.workflow_run?.html_url) lines.push(`\n<a href="${esc(payload.workflow_run.html_url)}">Lihat run</a>`);
   } else {
     lines.push(`🔔 <b>GitHub event: ${esc(event)}</b>`);
@@ -506,4 +957,10 @@ export async function handleGithubWebhook(env: Env, request: Request): Promise<R
 
   await safeSend(env, chat, lines.join("\n"));
   return new Response("ok");
+}
+
+/* ------------------------------ helpers ------------------------------ */
+
+function backMenu(): any {
+  return { inline_keyboard: [[{ text: "⬅️ Menu Utama", callback_data: "menu:home" }]] };
 }

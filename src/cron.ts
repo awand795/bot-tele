@@ -30,12 +30,14 @@ async function runReminders(env: Env): Promise<void> {
 
 /** Entry point for the every-minute cron trigger. */
 export async function runCron(env: Env, now = new Date()): Promise<void> {
-  const minute = now.getUTCMinutes();
-  const jobs: Array<Promise<void>> = [runReminders(env)];
-
-  if (minute % 5 === 0) jobs.push(checkMonitors(env));
-  if (minute % 10 === 0) jobs.push(checkFeeds(env));
-  if (minute % 15 === 0) jobs.push(checkAlerts(env));
+  // Setiap job memilih item yang sudah jatuh tempo (interval per item di D1).
+  // Dengan begitu interval bisa diubah tanpa mengubah jadwal cron Worker.
+  const jobs: Array<Promise<void>> = [
+    runReminders(env),
+    checkMonitors(env),
+    checkFeeds(env),
+    checkAlerts(env),
+  ];
 
   const results = await Promise.allSettled(jobs);
   for (const result of results) {

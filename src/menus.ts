@@ -128,6 +128,7 @@ export function settingMenu(isOwner: boolean): InlineKeyboardMarkup {
       { text: "👥 Users", callback_data: "menu:users" },
       { text: "📊 Statistik", callback_data: "menu:stats" },
     ]);
+    rows.push([{ text: "⏱ Cron", callback_data: "menu:cron" }]);
   }
   rows.push([{ text: "⬅️ Kembali", callback_data: "menu:home" }]);
   return { inline_keyboard: rows };
@@ -163,8 +164,10 @@ export const HELP_TEXT =
   "/tr en &lt;teks&gt; · /img &lt;prompt&gt; · /tts &lt;teks&gt;\n" +
   "/stt (reply voice note)\n\n" +
   "<b>Monitor</b>\n" +
-  "/rss add &lt;url&gt; · /monitor add &lt;url&gt;\n" +
-  "/alert BTC &gt; 100000 · /gh owner/repo\n\n" +
+  "/rss add &lt;url&gt; [menit] · /monitor add &lt;url&gt; [menit]\n" +
+  "/alert BTC &gt; 100000 [menit] · /gh owner/repo\n" +
+  "/monitor test|every|pause|resume · /rss every · /alert every\n" +
+  "/cron (owner) — lihat &amp; atur interval default\n\n" +
   "<b>Admin (owner)</b>\n" +
   "/allow &lt;id&gt; · /deny &lt;id&gt; · /users\n" +
   "/stats · /audit · /status · /backup\n\n" +
@@ -242,7 +245,12 @@ export const MONITOR_TEXT =
   "📈 <b>Uptime</b> — <code>/monitor add https://example.com</code>\n" +
   "🔔 <b>Harga</b> — <code>/alert BTC &gt; 100000</code>\n" +
   "🐙 <b>GitHub</b> — <code>/gh owner/repo</code>\n\n" +
-  "<i>Pengecekan otomatis lewat cron (RSS 10 menit, uptime 5 menit, harga 15 menit).</i>";
+  "⏱ <b>Interval bisa diatur</b> per item:\n" +
+  "<code>/monitor add &lt;url&gt; 10</code> · <code>/rss every &lt;id&gt; 30</code>\n" +
+  "<code>/alert every &lt;id&gt; 15</code> · <code>/monitor every &lt;id&gt; 5</code>\n\n" +
+  "Buka daftar monitor → klik item untuk cek sekarang, ubah interval, jeda, atau hapus.\n\n" +
+  "<i>Default: RSS 10m, uptime 5m, harga 15m. Owner bisa ubah lewat /cron.</i>\n" +
+  "<i>Status 🟡 = server merespons tapi akses dibatasi (401/403/429).</i>";
 
 export const SETTING_TEXT =
   "<b>⚙️ Setting</b>\n\n" +
@@ -251,7 +259,8 @@ export const SETTING_TEXT =
   "💾 <code>/backup</code> — backup data ke JSON\n\n" +
   "<b>Owner</b>\n" +
   "/allow &lt;id&gt; · /deny &lt;id&gt; · /users\n" +
-  "/stats · /audit · /gh owner/repo";
+  "/stats · /audit · /gh owner/repo\n" +
+  "/cron · /cron set monitor|rss|alert &lt;menit&gt;";
 
 export function rateLimited(resetInMinutes: number): string {
   return (

@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS feeds (
   title TEXT,
   last_seen TEXT,
   last_checked INTEGER,
+  interval_min INTEGER NOT NULL DEFAULT 10,
   created_at INTEGER NOT NULL
 );
 
@@ -62,6 +63,8 @@ CREATE TABLE IF NOT EXISTS monitors (
   url TEXT NOT NULL,
   status TEXT,
   last_checked INTEGER,
+  interval_min INTEGER NOT NULL DEFAULT 5,
+  paused INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 
@@ -73,6 +76,8 @@ CREATE TABLE IF NOT EXISTS alerts (
   op TEXT NOT NULL,
   target REAL NOT NULL,
   triggered INTEGER NOT NULL DEFAULT 0,
+  interval_min INTEGER NOT NULL DEFAULT 15,
+  last_checked INTEGER,
   created_at INTEGER NOT NULL
 );
 
@@ -120,3 +125,6 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT OR IGNORE INTO settings(key, value) VALUES ('allow_all', '0');
 INSERT OR IGNORE INTO settings(key, value) VALUES ('gh_repo', '');
 INSERT OR IGNORE INTO settings(key, value) VALUES ('gh_chat', '');
+INSERT OR IGNORE INTO settings(key, value) VALUES ('interval_monitor', '5');
+INSERT OR IGNORE INTO settings(key, value) VALUES ('interval_rss', '10');
+INSERT OR IGNORE INTO settings(key, value) VALUES ('interval_alert', '15');

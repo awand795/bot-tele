@@ -53,6 +53,7 @@ const COMMANDS: Record<string, Handler> = {
   alert: monitor.cmdAlert,
 
   gh: admin.cmdGh,
+  cron: admin.cmdCron,
   allow: admin.cmdAllow,
   deny: admin.cmdDeny,
   users: admin.cmdUsers,
@@ -220,6 +221,10 @@ export async function dispatchCallback(
     await setState(env, cb.from.id, spec.flow);
     await sendMessage(env, chatId, spec.text, { keyboard: backMenu() });
     return true;
+  }
+
+  if (data.startsWith("mon_")) {
+    if (await monitor.handleMonitorCallback(env, chatId, messageId, cb.from.id, data)) return true;
   }
 
   const idActionPrefixes = [

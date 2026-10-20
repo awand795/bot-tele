@@ -5,6 +5,12 @@ import { getOwner, getSetting, listUsers, setRole, setSetting } from "../users";
 import { formatWib, wibDay } from "../time";
 import { logAudit } from "../stats";
 import type { Env } from "../env";
+import {
+  getIntervalDefault,
+  intervalRange,
+  validateInterval,
+  type IntervalKind,
+} from "./monitor";
 
 export async function isOwner(env: Env, userId: number): Promise<boolean> {
   const owner = await getOwner(env);
@@ -177,6 +183,93 @@ export async function cmdGh(ctx: Ctx): Promise<void> {
       `Webhook URL:\n<code>${esc(ctx.origin)}/gh/${ctx.env.WEBHOOK_SECRET}</code>\n` +
       `Content type: <code>application/json</code>\nSecret: <code>${esc(ctx.env.WEBHOOK_SECRET)}</code>\n` +
       `Event: push, issues, pull_request, release, workflow_run`,
+  );
+}
+
+export async function cmdCron(ctx: Ctx): Promise<void> {
+  if (!(await ownerOnly(ctx))) return;
+
+  const sub = (ctx.args[0] ?? "").toLowerCase();
+  if (sub === "set") {
+    const aliases: Record<string, IntervalKind> = {
+      monitor: "monitor",
+      uptime: "monitor",
+      rss: "rss",
+      feed: "rss",
+      alert: "alert",
+      harga: "alert",
+    };
+    const kind = aliases[(ctx.args[1] ?? "").toLowerCase()];
+    const value = validateInterval(kind ?? "monitor", Number(ctx.args[2]));
+    if (!kind || value === null) {
+      return sendMessage(
+        ctx.env,
+        ctx.chatId,
+        "Contoh: <code>/cron set monitor 10</code>\n" +
+          "Jenis: <code>monitor</code>, <code>rss</code>, <code>alert</code>\n" +
+          `Rentang: monitor ${intervalRange("monitor")}, RSS ${intervalRange("rss")}, alert ${intervalRange("alert")}.`,
+      );
+    }
+    await setSetting(ctx.env, `interval_${kind}`, String(value));
+    await logAudit(ctx.env, ctx.userId, "cron_set", `${kind}=${value}`);
+    return sendMessage(
+      ctx.env,
+      ctx.chatId,
+      `⏱ Default interval <b>${kind}</b> sekarang <b>${value} menit</b>.\n<i>Item lama tidak berubah; atur per item lewat /${kind === "monitor" ? "monitor every" : kind === "rss" ? "rss every" : "alert every"}.</i>`,
+    );
+  }
+
+  const defaults = {
+    monitor: await getIntervalDefault(ctx.env, "monitor"),
+    rss: await getIntervalDefault(ctx.env, "rss"),
+    alert: await getIntervalDefault(ctx.env, "alert"),
+  };
+  const now = Date.now();
+
+  const [monitorDue, feedDue, alertDue, monitorAll, feedAll, alertAll] = await Promise.all([
+    qFirst<{ n: number }>(
+      ctx.env,
+      "SELECT COUNT(*) AS n FROM monitors WHERE paused = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 5) * 60000 <= ?)",
+      now,
+    ),
+    qFirst<{ n: number }>(
+      ctx.env,
+      "SELECT COUNT(*) AS n FROM feeds WHERE last_checked IS NULL OR last_checked + COALESCE(interval_min, 10) * 60000 <= ?",
+      now,
+    ),
+    qFirst<{ n: number }>(
+      ctx.env,
+      "SELECT COUNT(*) AS n FROM alerts WHERE triggered = 0 AND (last_checked IS NULL OR last_checked + COALESCE(interval_min, 15) * 60000 <= ?)",
+      now,
+    ),
+    qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM monitors"),
+    qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM feeds"),
+    qFirst<{ n: number }>(ctx.env, "SELECT COUNT(*) AS n FROM alerts WHERE triggered = 0"),
+  ]);
+
+  await sendMessage(
+    ctx.env,
+    ctx.chatId,
+    [
+      "⏱ <b>Cron & interval</b>",
+      "",
+      "Reminder: tiap <b>1 menit</b> (tetap)",
+      `Monitor: default <b>${defaults.monitor} menit</b>`,
+      `RSS: default <b>${defaults.rss} menit</b>`,
+      `Alert: default <b>${defaults.alert} menit</b>`,
+      "",
+      `<b>Antrean sekarang</b>`,
+      `📈 monitor due: ${monitorDue?.n ?? 0}/${monitorAll?.n ?? 0}`,
+      `📡 feed due: ${feedDue?.n ?? 0}/${feedAll?.n ?? 0}`,
+      `🔔 alert due: ${alertDue?.n ?? 0}/${alertAll?.n ?? 0}`,
+      "",
+      "<b>Ubah default</b>",
+      "<code>/cron set monitor 10</code>",
+      "<code>/cron set rss 30</code>",
+      "<code>/cron set alert 15</code>",
+      "",
+      "<i>Interval per item: /monitor every, /rss every, /alert every.</i>",
+    ].join("\n"),
   );
 }
 

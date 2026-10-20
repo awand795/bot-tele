@@ -522,6 +522,9 @@ async function handleMenu(
     case "backup":
       await dispatchCommand(ctx, "/backup");
       return;
+    case "cron":
+      await dispatchCommand(ctx, "/cron");
+      return;
     default:
       await editMessage(env, chatId, messageId, START_TEXT, { keyboard: mainMenu() });
   }

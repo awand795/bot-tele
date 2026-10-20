@@ -79,14 +79,18 @@ Format pengingat (WIB):
 
 ### 📡 Monitor
 
-| Command | Fungsi | Interval cek |
+| Command | Fungsi | Interval default |
 | --- | --- | --- |
-| `/rss add <url>` | Notifikasi item RSS/Atom baru (maks 5/user) | ±10 menit |
-| `/monitor add <url>` | Notifikasi website up/down (maks 5/user) | ±5 menit |
-| `/alert BTC > 100000` | Alert harga crypto USD (maks 10/user) | ±15 menit |
+| `/rss add <url> [menit]` | Notifikasi item RSS/Atom baru (maks 5/user) | 10 menit |
+| `/monitor add <url> [menit]` | Notifikasi website up/down (maks 5/user) | 5 menit |
+| `/alert BTC > 100000 [menit]` | Alert harga crypto USD (maks 10/user) | 15 menit |
 | `/gh owner/repo` | Notifikasi GitHub (push, issue, PR, release, workflow) | realtime webhook |
 
-- `/rss`, `/monitor`, `/alert` tanpa argumen → daftar + tombol hapus.
+- Cron Worker tetap jalan **tiap menit**; setiap item hanya dicek jika sudah jatuh tempo (`last_checked + interval_min`).
+- Ubah interval per item: `/monitor every <id> <menit>`, `/rss every <id> <menit>`, `/alert every <id> <menit>`.
+- `/monitor` tanpa argumen menampilkan daftar; klik item untuk **cek sekarang**, pilih **1m/5m/15m/60m**, **jeda/aktifkan**, atau hapus.
+- Default global untuk item baru diatur owner lewat `/cron` dan `/cron set monitor|rss|alert <menit>`.
+- Status uptime: 🟢 **up** (2xx–3xx), 🟡 **terproteksi** (401/403/429 — server merespons tapi akses dibatasi), 🔴 **down** (5xx, timeout, 4xx lain).
 - Harga: CoinGecko, fallback Binance jika kena rate limit.
 - GitHub webhook: `POST /gh/<WEBHOOK_SECRET>`, signatura `X-Hub-Signature-256` diverifikasi.
 
@@ -103,6 +107,8 @@ Format pengingat (WIB):
 | `/stats` | owner | Statistik hari ini |
 | `/audit` | owner | Audit log terakhir |
 | `/gh owner/repo` | owner | Aktifkan notifikasi GitHub |
+| `/cron` | owner | Lihat antrean & interval default |
+| `/cron set <monitor\|rss\|alert> <menit>` | owner | Ubah interval default item baru |
 
 - User pertama yang `/start` menjadi **owner**.
 - User lain masuk status **pending** sampai di-`/allow`.
@@ -154,8 +160,9 @@ todos(id, user_id, text, done, created_at)
 reminders(id, user_id, chat_id, text, due_at, sent, created_at)
 pastes(slug, user_id, text, created_at, expires_at)
 feeds(id, user_id, chat_id, url, title, last_seen, last_checked, created_at)
-monitors(id, user_id, chat_id, url, status, last_checked, created_at)
-alerts(id, user_id, chat_id, symbol, op, target, triggered, created_at)
+feeds(id, user_id, chat_id, url, title, last_seen, last_checked, interval_min, created_at)
+monitors(id, user_id, chat_id, url, status, last_checked, interval_min, paused, created_at)
+alerts(id, user_id, chat_id, symbol, op, target, triggered, interval_min, last_checked, created_at)
 ai_usage(user_id, day, count)
 stats(day, feature, count)
 audit(id, user_id, action, meta, created_at)
@@ -394,6 +401,15 @@ Beberapa feed (mis. hnrss.org) kadang > 15 detik dari IP Worker. Item akan dicob
 - URL fetch maksimal **20 MB**, multipart maksimal **50 MB** → threshold bot **45 MB**.
 - `callback_data` maksimal 64 byte → file_id tidak dimasukkan ke callback (pakai ID vault).
 
+### 10. Monitor 403 / Cloudflare `error code: 1003`
+
+Cloudflare menolak request ke **alamat IP mentah** dengan `403 error code: 1003` (DNS/URL tidak diizinkan).
+Bot otomatis mencoba ulang lewat `<ip>.nip.io` bila host masih berupa IP. Tetap disarankan memakai
+**domain/hostname** asli, misalnya `http://94.237.69.119.nip.io:5173/`.
+
+Status 🟡 **terproteksi** bukan berarti server mati: server membalas, tetapi meminta login atau diblokir
+Cloudflare/WAF. Kalau ingin dianggap benar-benar online, monitor URL yang bisa diakses publik.
+
 ---
 
 ## Troubleshooting
@@ -409,6 +425,7 @@ Beberapa feed (mis. hnrss.org) kadang > 15 detik dari IP Worker. Item akan dicob
 | Video gagal terkirim | Telegram gagal fetch `/dl` | Tes `/_link`, pastikan Range `206` |
 | `429` Instagram | Rate limit IP | Tunggu / pakai link lain |
 | Alert harga tidak masuk | CoinGecko 429 | Fallback Binance otomatis; cek `/alert` |
+| Monitor `down (403)` | IP mentah diblokir Cloudflare (`1003`) | Pakai `http://<ip>.nip.io:<port>/` atau domain asli |
 | Inline tidak muncul | Inline mode belum aktif | `/setinline` di @BotFather |
 | KV write habis | Batas 1.000/hari | Kurangi cache/state write |
 
