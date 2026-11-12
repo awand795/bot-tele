@@ -314,6 +314,18 @@ export async function getYtInfo(env: Env, id: string, force = false): Promise<Yt
     }
   }
 
+  // Saat refresh paksa, jangan buang format yang masih ada di cache: jalur tertentu
+  // (mis. lewat proxy) bisa hanya mengembalikan video tanpa audio.
+  let previous: YtInfo | null = null;
+  if (force) {
+    try {
+      const raw = await env.BOT_KV.get(cacheKey);
+      if (raw) previous = JSON.parse(raw) as YtInfo;
+    } catch {
+      /* ignore */
+    }
+  }
+
   const player = await fetchPlayable(id, env.YOUTUBE_COOKIE?.trim() || undefined);
   const details = player.videoDetails ?? {};
   const streaming = player.streamingData ?? {};
@@ -364,6 +376,13 @@ export async function getYtInfo(env: Env, id: string, force = false): Promise<Yt
     videoOnly,
     videoAlternatives: [...videoCandidates, ...videoOnly],
   };
+
+  if (previous) {
+    info.video = info.video ?? previous.video;
+    info.audio = info.audio ?? previous.audio;
+    if (!info.videoOnly?.length) info.videoOnly = previous.videoOnly ?? [];
+    info.videoAlternatives = [...(info.videoAlternatives ?? []), ...(previous.videoAlternatives ?? [])];
+  }
 
   await env.BOT_KV.put(cacheKey, JSON.stringify(info), { expirationTtl: 1200 });
   // Touch the local variable to keep the linter quiet about `formats`.

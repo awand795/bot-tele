@@ -120,11 +120,30 @@ button.addEventListener("click", async () => {
   status.className = "";
   status.textContent = "Mengunduh video dan audio…";
 
-  try {
-    const [videoRes, audioRes] = await Promise.all([fetch(VIDEO_URL), fetch(AUDIO_URL)]);
-    if (!videoRes.ok || !audioRes.ok || !videoRes.body || !audioRes.body) {
-      throw new Error("Sumber video tidak bisa diambil. Link mungkin sudah kedaluwarsa.");
+  // Sumber bisa sesaat membalas 403/5xx (URL media kedaluwarsa lalu di-resolve ulang
+  // oleh server), jadi setiap unduhan dicoba beberapa kali sebelum menyerah.
+  async function loadMedia(url, label) {
+    let last = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (res.ok && res.body) return res;
+        last = "Sumber " + label + " membalas " + res.status + ".";
+        await res.body?.cancel().catch(() => {});
+      } catch {
+        last = "Koneksi ke sumber " + label + " gagal.";
+      }
+      if (attempt < 2) status.textContent = "Mencoba ulang " + label + "…";
+      await new Promise((resolve) => setTimeout(resolve, 1200));
     }
+    throw new Error(last + " Coba lagi sebentar lagi.");
+  }
+
+  try {
+    const [videoRes, audioRes] = await Promise.all([
+      loadMedia(VIDEO_URL, "video"),
+      loadMedia(AUDIO_URL, "audio"),
+    ]);
 
     const parts = [];
     let total = 0;
