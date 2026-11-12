@@ -54,6 +54,7 @@ git check-ignore -v .env
 | `TERABOX_COOKIE` | Download TeraBox | Opsional; saat ini kosong |
 | `INSTAGRAM_COOKIE` | Instagram web/app API | Sudah diset sebagai Worker secret; nilainya tidak disimpan di `.env` |
 | `TIKTOK_COOKIE` | CDN TikTok + API | Sudah diset sebagai Worker secret dan ada di `.env` |
+| `YOUTUBE_COOKIE` | Bypass bot-check YouTube | Opsional; isi lewat `.env` lalu `set-secrets` |
 
 > Cookie platform memberi **akses penuh ke akun**. Gunakan akun cadangan. Rotasi setelah testing.
 
@@ -169,6 +170,7 @@ Telegram ──POST /tg/<secret>──► router
 
 Telegram ──GET /dl/<token>──► verifikasi HMAC ──► resolve upstream ──► stream (Range)
 Browser  ──GET /p/<slug>──► halaman paste (HTML)
+Browser  ──GET /m/<token>──► halaman gabung video+audio YouTube (remux di browser user)
 GitHub   ──POST /gh/<secret>──► verifikasi HMAC ──► notifikasi ke chat
 Cron     ──* * * * *──► reminder · uptime · RSS · alert
 ```
@@ -177,11 +179,13 @@ File penting:
 
 | File | Fungsi |
 | --- | --- |
-| `src/index.ts` | HTTP router: `/tg`, `/dl`, `/p`, `/gh`, `/health`, debug |
+| `src/index.ts` | HTTP router: `/tg`, `/dl`, `/p`, `/m`, `/gh`, `/health`, debug |
 | `src/router.ts` | Dispatch update, menu, callback, flow TeraBox |
 | `src/sender.ts` | Strategi kirim: URL → upload → link |
 | `src/resolve.ts` | Payload → stream upstream, guard content-type |
-| `src/crypto.ts` | HMAC signed URL |
+| `src/crypto.ts` | HMAC signed URL (`verifyPayload` harus tetap menolak token rusak tanpa throw) |
+| `src/web/mux-page.ts` | Halaman HTML gabung video + audio |
+| `src/web/mux-client.txt` | Penggabung fMP4 yang jalan di browser (di-import sebagai teks) |
 | `src/extract/tiktok.ts` | TikWM, proxy, web API, mobile page, validasi media |
 | `src/extract/instagram.ts` | Shortcode → media ID, cookie, web/app API, embed |
 | `src/cron.ts` | Entry cron tiap menit |
@@ -192,7 +196,7 @@ File penting:
 
 | Fitur | Status | Catatan |
 | --- | --- | --- |
-| YouTube | ✅ | Hanya 360p muxed; audio M4A |
+| YouTube | ✅ | 360p muxed (bersuara); 720p/1080p video-only; HD + suara lewat halaman `/m` |
 | TikTok | ✅ | TikWM + proxy + mobile page; cookie CDN; rate limit sesekali |
 | Instagram | ⚠️ | Butuh cookie; rotasi cookie yang terekspos |
 | Facebook | ✅ | Plugin embed + regex halaman |
@@ -200,6 +204,65 @@ File penting:
 | Inline mode | ⚠️ | `/setinline` harus diaktifkan manual di @BotFather |
 | Vault/STT | ⚠️ | Kode ada, pengiriman visual belum dikonfirmasi penuh |
 | AI | ✅ | Workers AI, 20 request/user/hari |
+
+### Catatan YouTube
+
+Client yang dipakai bot (`ANDROID_VR`) hanya memberi satu format **muxed** (video+audio
+jadi satu), yaitu itag 18 / 360p. Stream 720p dan 1080p hanya tersedia sebagai
+**adaptive video-only** (tanpa audio). Anggapan ini sudah diverifikasi lewat probe ke
+client IOS, ANDROID, ANDROID_TESTSUITE, MWEB, dan WEB_EMBEDDED_PLAYER.
+
+Bot memilih varian H.264 (`avc1`) per resolusi supaya bisa diputar di semua client
+Telegram. 1080p biasanya >45 MB sehingga jatuh ke mode link; 720p sering masih
+bisa diunggah. Jangan menambahkan transcode/mux di Worker: CPU limit free plan
+10 ms dan memori 128 MB.
+
+Supaya HD tetap bersuara, tombol 🔊 di preview mengarah ke `/m/<token>`: halaman HTML
+mandiri yang mengunduh stream video + audio lewat `/dl`, lalu menggabungkannya menjadi
+satu MP4 **di browser user** (`src/web/mux-client.txt`), tanpa proses media di Worker.
+Penggabung itu tidak men-decode/meng-encode; ia menyalin `trak` video, menambah `trak`
+audio sebagai track 2, lalu menyelang-seling fragment `moof/mdat` berdasarkan `tfdt`.
+Konsekuensinya: hasil masuk folder Download user (bukan ke chat), 1080p berat di HP,
+dan link halaman memakai TTL `LINK_TTL` (2 jam).
+
+Kalau menyentuh `src/web/mux-client.txt`, uji dengan ffmpeg/ffprobe lokal: hasil harus
+mempunyai dua stream (h264 + aac) dan lolos `ffmpeg -v error -i hasil.mp4 -f null -`.
+Jangan menambah field payload `/m` tanpa menyesuaikan `renderMuxPage`.
+
+#### Bot-check YouTube
+
+Sejak akhir 2026 YouTube sering membalas `LOGIN_REQUIRED` ("Sign in to confirm you're
+not a bot") untuk IP datacenter termasuk Cloudflare, pada semua client. Urutan yang
+dipakai `getYtInfo`:
+
+1. Client `ANDROID_VR` — satu-satunya yang masih memberi format muxed 360p bersuara.
+2. Client `IOS` — cadangan; sering hanya mengembalikan audio, jadi hanya diterima
+   kalau ada format video dengan URL langsung.
+3. Scrape `ytInitialPlayerResponse` lewat `www-youtube-com.translate.goog`.
+
+Jalur 3 membuat permintaan player datang dari IP Google sehingga lolos bot-check, dan
+parameter `ip=` pada URL media berisi IP peminta (Worker) — jadi `/dl` tetap bisa
+streaming dari Worker. Konsekuensinya jalur 3 hanya memberi format adaptive: tidak ada
+360p bersuara. `extractYouTube` lalu memakai video adaptive terdekat 360p sebagai media
+utama dengan tanda `silent: true`, dan preview menampilkan tombol 🔊 ke halaman gabung.
+
+Catatan operasional:
+
+- `getYtInfo` mengabaikan cache KV yang tidak punya `video` maupun `videoOnly`, supaya
+  entri lama (audio-only) tidak membuat `medias` kosong.
+- `/_link` dan `/_send` mengembalikan JSON error bila `medias` kosong; jangan hapus guard
+  ini, sebelumnya gejalanya `Cannot read properties of undefined (reading 'yt')`.
+- Halaman translate ±1,4 MB per video; tetap di bawah CPU limit, tapi jangan menambah
+  parsing berat di jalur ini.
+- Kalau semua jalur gagal, bot membalas "YouTube membatasi permintaan dari server ini".
+  Uji ulang beberapa saat kemudian, jangan langsung mengubah kode.
+- Jalur 3 hanya best-effort: sebagian video mengembalikan `signatureCipher` (tanpa
+  `url`) yang tidak bisa dipakai tanpa menjalankan JS player, jadi jangan diandalkan
+  sebagai satu-satunya sumber.
+- Perbaikan yang reliabel: set `YOUTUBE_COOKIE` (cookie akun YouTube dari browser yang
+  sudah login) lewat `.env` + `set-secrets`. Cookie membuat client innertube lolos
+  bot-check. Tanpa cookie, kemampuan YouTube bergantung IP Worker dan bisa hilang
+  sewaktu-waktu.
 
 ### Catatan TikTok
 

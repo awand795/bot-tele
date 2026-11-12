@@ -42,13 +42,14 @@ export async function verifyPayload(env: Env, token: string): Promise<Record<str
   const parts = token.split(".");
   if (parts.length !== 2) return null;
   const [b64, sig] = parts;
-  const ok = await crypto.subtle.verify("HMAC", await getKey(env), unb64url(sig), enc.encode(b64));
-  if (!ok) return null;
   try {
+    const ok = await crypto.subtle.verify("HMAC", await getKey(env), unb64url(sig), enc.encode(b64));
+    if (!ok) return null;
     const json = JSON.parse(new TextDecoder().decode(unb64url(b64)));
     if (typeof json.e !== "number" || json.e < Math.floor(Date.now() / 1000)) return null;
     return json;
   } catch {
+    // Token rusak/bukan base64 valid: perlakukan seperti link kedaluwarsa.
     return null;
   }
 }

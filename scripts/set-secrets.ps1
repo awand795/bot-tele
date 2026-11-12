@@ -12,7 +12,8 @@ $names = @(
   "WEBHOOK_SECRET",
   "TERABOX_COOKIE",
   "INSTAGRAM_COOKIE",
-  "TIKTOK_COOKIE"
+  "TIKTOK_COOKIE",
+  "YOUTUBE_COOKIE"
 )
 
 foreach ($name in $names) {

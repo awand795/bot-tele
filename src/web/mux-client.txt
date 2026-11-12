@@ -1,0 +1,318 @@
+/**
+ * Menggabungkan stream video-only dan audio-only dari YouTube menjadi satu MP4.
+ *
+ * Keduanya sudah berbentuk fragmented MP4 (ftyp + moov + moof/mdat), jadi tidak
+ * perlu decode/encode: cukup salin trak video, tambahkan trak audio, lalu
+ * selang-seling fragment sesuai waktunya. Semua pekerjaan berjalan di browser.
+ */
+
+const HEADER_SKIP = ["sidx", "styp", "free", "skip", "wide", "mfra", "udta"];
+
+function u32(bytes, off) {
+  return ((bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]) >>> 0;
+}
+
+function w32(bytes, off, value) {
+  bytes[off] = (value >>> 24) & 0xff;
+  bytes[off + 1] = (value >>> 16) & 0xff;
+  bytes[off + 2] = (value >>> 8) & 0xff;
+  bytes[off + 3] = value & 0xff;
+}
+
+function typeAt(bytes, off) {
+  return String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+}
+
+function boxOf(type, parts) {
+  let size = 8;
+  for (const part of parts) size += part.length;
+  const out = new Uint8Array(size);
+  w32(out, 0, size);
+  out.set([...type].map((c) => c.charCodeAt(0)), 4);
+  let off = 8;
+  for (const part of parts) {
+    out.set(part, off);
+    off += part.length;
+  }
+  return out;
+}
+
+function readU64(bytes, off) {
+  return Number(new DataView(bytes.buffer, bytes.byteOffset + off, 8).getBigUint64(0));
+}
+
+/** Ukuran + tipe box pada offset tertentu. */
+function boxAt(bytes, off) {
+  const size32 = u32(bytes, off);
+  if (size32 === 1) return { size: readU64(bytes, off + 8), header: 16, type: typeAt(bytes, off) };
+  if (size32 === 0) return { size: bytes.length - off, header: 8, type: typeAt(bytes, off) };
+  return { size: size32, header: 8, type: typeAt(bytes, off) };
+}
+
+function childrenOf(bytes, start, end) {
+  const out = [];
+  let off = start;
+  while (off + 8 <= end) {
+    const box = boxAt(bytes, off);
+    if (box.size < box.header || off + box.size > end) break;
+    out.push({ ...box, offset: off });
+    off += box.size;
+  }
+  return out;
+}
+
+/** Pembaca box top-level bertahap dari sebuah ReadableStream. */
+function createBoxReader(stream) {
+  const reader = stream.getReader();
+  let queue = [];
+  let queued = 0;
+  let eof = false;
+
+  async function ensure(n) {
+    while (queued < n && !eof) {
+      const { value, done } = await reader.read();
+      if (done) eof = true;
+      else if (value && value.length) {
+        queue.push(value);
+        queued += value.length;
+      }
+    }
+    return queued >= n;
+  }
+
+  function peek(n) {
+    const out = new Uint8Array(n);
+    let copied = 0;
+    for (const chunk of queue) {
+      const take = Math.min(chunk.length, n - copied);
+      out.set(chunk.subarray(0, take), copied);
+      copied += take;
+      if (copied === n) break;
+    }
+    return out;
+  }
+
+  function take(n) {
+    const out = new Uint8Array(n);
+    let copied = 0;
+    while (copied < n) {
+      const chunk = queue[0];
+      const needed = n - copied;
+      if (chunk.length <= needed) {
+        out.set(chunk, copied);
+        copied += chunk.length;
+        queued -= chunk.length;
+        queue.shift();
+      } else {
+        out.set(chunk.subarray(0, needed), copied);
+        copied += needed;
+        queued -= needed;
+        queue[0] = chunk.subarray(needed);
+      }
+    }
+    return out;
+  }
+
+  return {
+    async readBox() {
+      if (!(await ensure(8))) return null;
+      const head = peek(8);
+      let size = u32(head, 0);
+      let header = 8;
+      if (size === 1) {
+        if (!(await ensure(16))) throw new Error("File sumber terputus.");
+        size = readU64(peek(16), 8);
+        header = 16;
+      }
+      if (size === 0) {
+        // Box terakhir yang memanjang sampai akhir stream.
+        take(header);
+        while (!eof) await ensure(queued + 1);
+        return { type: typeAt(head, 0), bytes: take(queued) };
+      }
+      if (size < header) throw new Error("Struktur file sumber tidak dikenali.");
+      if (!(await ensure(size))) throw new Error("File sumber terputus.");
+      return { type: typeAt(head, 0), bytes: take(size) };
+    },
+    cancel() {
+      reader.cancel().catch(() => {});
+    },
+  };
+}
+
+async function readInit(stream) {
+  const reader = createBoxReader(stream);
+  let ftyp = null;
+  let moov = null;
+
+  for (let i = 0; i < 16 && !moov; i++) {
+    const box = await reader.readBox();
+    if (!box) break;
+    if (box.type === "ftyp") ftyp = box.bytes;
+    else if (box.type === "moov") moov = box.bytes;
+    else if (!HEADER_SKIP.includes(box.type) && box.type !== "styp" && box.type !== "mdat") {
+      // Box tak dikenal sebelum moov, abaikan saja.
+    }
+  }
+
+  if (!moov) throw new Error("Bagian awal file tidak lengkap.");
+  return { reader, ftyp, moov };
+}
+
+function trackInfo(trakBytes) {
+  const kids = childrenOf(trakBytes, 8, trakBytes.length);
+  const tkhd = kids.find((k) => k.type === "tkhd");
+  const mdia = kids.find((k) => k.type === "mdia");
+  if (!tkhd || !mdia) throw new Error("Track video/audio tidak dikenali.");
+
+  const version = trakBytes[tkhd.offset + 8];
+  const trackId = u32(trakBytes, tkhd.offset + 8 + 4 + (version === 1 ? 16 : 8));
+
+  const mdhd = childrenOf(trakBytes, mdia.offset + mdia.header, mdia.offset + mdia.size).find(
+    (k) => k.type === "mdhd",
+  );
+  if (!mdhd) throw new Error("Durasi track tidak dikenali.");
+  const mdhdVersion = trakBytes[mdhd.offset + 8];
+  const timescale = u32(trakBytes, mdhd.offset + 8 + 4 + (mdhdVersion === 1 ? 16 : 8)) || 1;
+
+  return { bytes: trakBytes, trackId, timescale };
+}
+
+function parseMoov(moovBytes) {
+  const kids = childrenOf(moovBytes, 8, moovBytes.length);
+  const mvhd = kids.find((k) => k.type === "mvhd");
+  if (!mvhd) throw new Error("Header video tidak dikenali.");
+
+  const traks = kids.filter((k) => k.type === "trak").map((k) => trackInfo(moovBytes.subarray(k.offset, k.offset + k.size)));
+  if (!traks.length) throw new Error("Track tidak ditemukan di file sumber.");
+
+  const mvex = kids.find((k) => k.type === "mvex");
+  const trexes = mvex
+    ? childrenOf(moovBytes, mvex.offset + mvex.header, mvex.offset + mvex.size)
+        .filter((k) => k.type === "trex")
+        .map((k) => moovBytes.subarray(k.offset, k.offset + k.size))
+    : [];
+
+  return {
+    mvhd: moovBytes.subarray(mvhd.offset, mvhd.offset + mvhd.size),
+    traks,
+    trexes,
+  };
+}
+
+function buildMoov(video, audio) {
+  const mvhd = new Uint8Array(video.mvhd);
+  w32(mvhd, mvhd.length - 4, 3); // next_track_ID
+
+  const trakAudio = new Uint8Array(audio.traks[0].bytes);
+  const tkhd = childrenOf(trakAudio, 8, trakAudio.length).find((k) => k.type === "tkhd");
+  const trakTrackId = 2;
+  if (tkhd) {
+    const version = trakAudio[tkhd.offset + 8];
+    w32(trakAudio, tkhd.offset + 8 + 4 + (version === 1 ? 16 : 8), trakTrackId);
+  }
+
+  const trexVideo = video.trexes[0];
+  const trexAudio = audio.trexes[0] ? new Uint8Array(audio.trexes[0]) : null;
+  if (trexAudio) w32(trexAudio, 12, trakTrackId);
+
+  const trexes = [trexVideo, trexAudio].filter(Boolean);
+  const mvex = trexes.length ? [boxOf("mvex", trexes)] : [];
+
+  return boxOf("moov", [mvhd, video.traks[0].bytes, trakAudio, ...mvex]);
+}
+
+/** Fragmen berikutnya (moof + mdat) beserta waktu mulainya dalam detik. */
+async function nextFragment(reader, timescale) {
+  for (;;) {
+    const box = await reader.readBox();
+    if (!box) return null;
+    if (box.type !== "moof") continue;
+
+    const mdat = await reader.readBox();
+    if (!mdat) throw new Error("Fragment di file sumber tidak lengkap.");
+    if (mdat.type !== "mdat") throw new Error("Struktur fragment tidak didukung.");
+
+    return { moof: box.bytes, mdat: mdat.bytes, time: fragmentTime(box.bytes, timescale) };
+  }
+}
+
+function fragmentTime(moofBytes, timescale) {
+  const kids = childrenOf(moofBytes, 8, moofBytes.length);
+  for (const kid of kids) {
+    if (kid.type !== "traf") continue;
+    const parts = childrenOf(moofBytes, kid.offset + kid.header, kid.offset + kid.size);
+    const tfdt = parts.find((p) => p.type === "tfdt");
+    if (!tfdt) continue;
+    const version = moofBytes[tfdt.offset + 8];
+    const base = version === 1 ? readU64(moofBytes, tfdt.offset + 12) : u32(moofBytes, tfdt.offset + 12);
+    return base / timescale;
+  }
+  return 0;
+}
+
+function patchFragment(moofBytes, sequence, trackId) {
+  const out = new Uint8Array(moofBytes);
+  for (const kid of childrenOf(out, 8, out.length)) {
+    if (kid.type === "mfhd") {
+      w32(out, kid.offset + 12, sequence);
+    } else if (kid.type === "traf") {
+      for (const part of childrenOf(out, kid.offset + kid.header, kid.offset + kid.size)) {
+        if (part.type === "tfhd") w32(out, part.offset + 12, trackId);
+      }
+    }
+  }
+  return out;
+}
+
+function concat(parts) {
+  let size = 0;
+  for (const part of parts) size += part.length;
+  const out = new Uint8Array(size);
+  let off = 0;
+  for (const part of parts) {
+    out.set(part, off);
+    off += part.length;
+  }
+  return out;
+}
+
+/**
+ * Generator: menghasilkan potongan MP4 hasil gabungan video + audio.
+ * @param {ReadableStream<Uint8Array>} videoStream
+ * @param {ReadableStream<Uint8Array>} audioStream
+ */
+export async function* mergeVideoAudio(videoStream, audioStream) {
+  const video = await readInit(videoStream);
+  const audio = await readInit(audioStream);
+
+  const videoMoov = parseMoov(video.moov);
+  const audioMoov = parseMoov(audio.moov);
+
+  yield concat([video.ftyp || audio.ftyp || new Uint8Array(0), buildMoov(videoMoov, audioMoov)]);
+
+  const videoTimescale = videoMoov.traks[0].timescale;
+  const audioTimescale = audioMoov.traks[0].timescale;
+
+  let sequence = 1;
+  let videoFragment = await nextFragment(video.reader, videoTimescale);
+  let audioFragment = await nextFragment(audio.reader, audioTimescale);
+
+  try {
+    while (videoFragment || audioFragment) {
+      const useVideo = videoFragment && (!audioFragment || videoFragment.time <= audioFragment.time);
+      if (useVideo) {
+        yield patchFragment(videoFragment.moof, sequence++, videoMoov.traks[0].trackId);
+        yield videoFragment.mdat;
+        videoFragment = await nextFragment(video.reader, videoTimescale);
+      } else {
+        yield patchFragment(audioFragment.moof, sequence++, 2);
+        yield audioFragment.mdat;
+        audioFragment = await nextFragment(audio.reader, audioTimescale);
+      }
+    }
+  } finally {
+    video.reader.cancel();
+    audio.reader.cancel();
+  }
+}

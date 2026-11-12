@@ -1,6 +1,8 @@
 import type { Env } from "./env";
+import { LIMITS } from "./env";
 import { handleUpdate } from "./router";
-import { verifyPayload } from "./crypto";
+import { signPayload, verifyPayload } from "./crypto";
+import { renderMuxPage } from "./web/mux-page";
 import { isMediaContentType, resolveStream, type StreamPayload } from "./resolve";
 import { detectPlatform, extractMedia } from "./extract";
 import { browseTeraBox, normalizeShare } from "./extract/terabox";
@@ -31,6 +33,54 @@ export default {
 
     if (url.pathname.startsWith("/p/")) {
       return servePaste(env, url.pathname.slice(3));
+    }
+
+    // Halaman gabung video + audio YouTube; penggabungan berjalan di browser user.
+    if (url.pathname.startsWith("/m/")) {
+      const payload = await verifyPayload(env, url.pathname.slice("/m/".length));
+      if (!payload || payload.t !== "mux") return new Response("Link kedaluwarsa.", { status: 410 });
+
+      const id = typeof payload.id === "string" ? payload.id : "";
+      const videoItag = Number(payload.vitag);
+      const audioItag = Number(payload.aitag);
+      const height = Number(payload.height) || 720;
+      const filename = typeof payload.name === "string" && payload.name ? payload.name : `${id}.mp4`;
+      const title = typeof payload.title === "string" && payload.title ? payload.title : filename;
+      const size = Number(payload.size) || undefined;
+
+      if (!id || !Number.isInteger(videoItag) || !Number.isInteger(audioItag)) {
+        return new Response("Link tidak valid.", { status: 400 });
+      }
+
+      const videoToken = await signPayload(
+        env,
+        { t: "yt", id, itag: videoItag, filename, kind: "video" },
+        LIMITS.LINK_TTL,
+      );
+      const audioToken = await signPayload(
+        env,
+        { t: "yt", id, itag: audioItag, filename: `${filename.replace(/\.mp4$/i, "")}.m4a`, kind: "audio" },
+        LIMITS.LINK_TTL,
+      );
+
+      return new Response(
+        renderMuxPage({
+          title,
+          filename,
+          height,
+          size,
+          videoUrl: `${origin}/dl/${videoToken}`,
+          audioUrl: `${origin}/dl/${audioToken}`,
+        }),
+        {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+            "X-Robots-Tag": "noindex",
+            "Referrer-Policy": "no-referrer",
+          },
+        },
+      );
     }
 
     if (url.pathname.startsWith("/gh/")) {
@@ -120,6 +170,7 @@ export default {
       try {
         const result = await extractMedia(env, target);
         const media = url.searchParams.get("mode") === "audio" ? result.extras[0] ?? result.medias[0] : result.medias[0];
+        if (!media) return json({ error: "Tidak ada media yang bisa diambil dari link itu." }, 502);
         const signed = await signedMediaUrl(env, origin, media, 600);
         return json({ kind: media.kind, filename: media.filename, size: media.size, signed });
       } catch (err) {
@@ -153,6 +204,7 @@ export default {
         const result = await extractMedia(env, target);
         const media =
           url.searchParams.get("mode") === "audio" ? result.extras[0] ?? result.medias[0] : result.medias[0];
+        if (!media) return json({ error: "Tidak ada media yang bisa diambil dari link itu." }, 502);
         const delivered = await deliverMedia(env, origin, chat, media, result.caption);
         return json({ ok: true, mode: delivered.mode, kind: media.kind, size: media.size });
       } catch (err) {

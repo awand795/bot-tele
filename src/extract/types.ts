@@ -15,6 +15,8 @@ export interface Media {
   alternates?: string[];
   /** Re-resolved from YouTube at download time (URLs expire). */
   yt?: { id: string; itag: number };
+  /** YouTube hanya memberi stream adaptive (gambar tanpa audio). */
+  silent?: boolean;
   /** Re-resolved from TeraBox at download time (URLs expire). */
   tb?: { share: string; fsId: string };
 }

@@ -103,7 +103,20 @@ export async function resolveStream(
 
   if (range) headers.Range = range;
 
-  const response = await fetch(url, { headers, redirect: "follow" });
+  let response = await fetch(url, { headers, redirect: "follow" });
+
+  // YouTube mengunci URL media ke IP peminta. Kalau IP Worker berubah (atau URL
+  // kedaluwarsa), resolve ulang sekali dengan data player yang baru.
+  if (payload.t === "yt" && (response.status === 403 || response.status === 410)) {
+    await response.body?.cancel().catch(() => {});
+    try {
+      const fresh = await resolveYtStream(env, payload.id, payload.itag, true);
+      response = await fetch(fresh.url, { headers, redirect: "follow" });
+    } catch (err) {
+      console.warn("yt re-resolve failed", (err as Error).message);
+    }
+  }
+
   const size = Number(response.headers.get("content-length") || 0) || undefined;
   const contentType = response.headers.get("content-type") || "application/octet-stream";
 

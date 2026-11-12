@@ -200,8 +200,10 @@ export const YOUTUBE_PROMPT =
   "<code>https://youtu.be/dQw4w9WgXcQ</code>\n\n" +
   "Tersedia:\n" +
   "• 🎬 Video 360p (dengan suara)\n" +
+  "• 🔊 Video 720p / 1080p + suara (lewat halaman gabung)\n" +
   "• 🎵 Audio M4A\n\n" +
-  "<i>Catatan: batas upload Telegram 45 MB.</i>";
+  "<i>YouTube tidak menyediakan satu file HD bersuara. Tombol 🔊 membuka halaman yang menggabungkan video dan audio di perangkat kamu.</i>\n" +
+  "<i>Batas upload Telegram 45 MB.</i>";
 
 export const STORY_TEXT =
   "<b>👀 Story</b>\n\n" +

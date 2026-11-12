@@ -10,6 +10,8 @@ export interface Env {
   INSTAGRAM_COOKIE?: string;
   /** Optional TikTok session cookie. Needed for reliable public media access. */
   TIKTOK_COOKIE?: string;
+  /** Optional YouTube account cookie. Lifts the "Sign in to confirm you're not a bot" block. */
+  YOUTUBE_COOKIE?: string;
 }
 
 export const LIMITS = {
