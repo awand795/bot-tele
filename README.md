@@ -337,6 +337,14 @@ Setelah itu ketik `@adnawaa_bot <judul/link>` di chat mana pun.
 
 ## Development lokal
 
+Untuk handoff / AI agent berikutnya, baca [`AGENTS.md`](AGENTS.md). Kredensial lokal
+disimpan di `.env` (sudah masuk `.gitignore`); template ada di `.env.example`.
+
+```powershell
+Copy-Item .env.example .env   # lalu isi nilainya
+. .\scripts\load-env.ps1      # muat .env ke sesi PowerShell
+```
+
 `.dev.vars` (jangan di-commit):
 
 ```
@@ -391,7 +399,18 @@ Instagram membatasi IP datacenter (`429`) dan API app sering membalas `login_req
 
 ### 3. TikTok sering `403` / `Free Api Limit`
 
-TikWM membatasi IP Worker. Fallback scrape `__UNIVERSAL_DATA_FOR_REHYDRATION__` tetap aktif, tetapi URL CDN TikTok bisa menolak IP Worker. Isi `TIKTOK_COOKIE` untuk membantu. Kalau sumber tetap `403`, bot menampilkan error yang jelas dan **tidak** mengunggah halaman error sebagai video.
+TikWM membatasi IP Worker. Bot memakai beberapa fallback:
+
+1. TikWM langsung.
+2. TikWM lewat proxy Google Translate (`*.translate.goog`) saat IP Worker kena limit.
+3. Web API `item/detail`.
+4. Scrape halaman TikTok dengan **User-Agent mobile** (lebih tahan `403` daripada desktop).
+
+Setiap URL media divalidasi dengan request `Range: bytes=0-0`; kalau CDN membalas `403`
+atau HTML, kandidat berikutnya dicoba. `TIKTOK_COOKIE` hanya dikirim ke host TikTok
+(`*.tiktok.com` / `*.tiktokv.com`), bukan ke TikWM/proxy. Kalau semua sumber gagal,
+bot menampilkan error yang jelas dan **tidak** mengunggah halaman error sebagai video.
+Rate limit TikWM/Google bisa pulih setelah beberapa saat; coba lagi nanti.
 
 ### 4. YouTube hanya 360p
 
@@ -474,6 +493,7 @@ Cloudflare/WAF. Kalau ingin dianggap benar-benar online, monitor URL yang bisa d
 ## Keamanan
 
 - Token Cloudflare dan token bot **pernah terekspos di chat** → rotasi setelah bot stabil.
+- Kredensial lokal disimpan di `.env` (gitignored). Jangan commit, upload, atau kirim isinya ke chat. Panduan lengkap: [`AGENTS.md`](AGENTS.md).
 - Jangan commit `.dev.vars`, `.webhook-secret.local`, atau cookie apa pun.
 - Repo ini **public** — kredensial hanya boleh disimpan sebagai **Worker secrets**.
 - `.gitignore`: `node_modules/`, `.wrangler/`, `.dev.vars`, `*.log`, `.env`, `.webhook-secret.local`.
