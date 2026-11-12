@@ -86,6 +86,19 @@ export async function resolveStream(
   } else {
     url = payload.url;
     headers = { "User-Agent": DEFAULT_UA, ...(payload.headers ?? {}) };
+
+    // TikTok's CDN can check the session cookies embedded in the signed URL.
+    const tiktokCookie = env.TIKTOK_COOKIE?.trim();
+    if (tiktokCookie) {
+      try {
+        const host = new URL(url).hostname.toLowerCase();
+        if (host === "tiktok.com" || host.endsWith(".tiktok.com") || host === "tiktokv.com" || host.endsWith(".tiktokv.com")) {
+          headers.Cookie = tiktokCookie;
+        }
+      } catch {
+        /* invalid URL, let fetch report it */
+      }
+    }
   }
 
   if (range) headers.Range = range;

@@ -11,6 +11,8 @@ export interface Media {
   title?: string;
   performer?: string;
   headers?: Record<string, string>;
+  /** Extra direct URLs to try when the primary is blocked/expired. */
+  alternates?: string[];
   /** Re-resolved from YouTube at download time (URLs expire). */
   yt?: { id: string; itag: number };
   /** Re-resolved from TeraBox at download time (URLs expire). */
